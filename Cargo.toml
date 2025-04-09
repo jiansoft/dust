@@ -7,3 +7,4 @@ edition = "2024"
 regex = "1"
 dialoguer = "0.11"
 clap = { version = "4.5.35", features = ["derive"] }
+rayon = "1.10.0"
