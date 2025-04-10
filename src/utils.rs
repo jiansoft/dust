@@ -1,14 +1,6 @@
-use regex::Regex;
 use rayon::prelude::*;
-use std::{
-    collections::VecDeque,
-    fs,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use regex::Regex;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// 遞迴搜尋符合指定模式的資料夾（例如 `bin/`、`obj/`、`node_modules/`）
@@ -46,50 +38,42 @@ pub fn collect_matching_folders(path: &Path, pattern: &Regex, result: &mut Vec<P
 
     result.par_extend(
         dirs.par_iter()
-            .filter(|entry| {
-                entry.path()
-                    .to_str()
-                    .map_or(false, |s| pattern.is_match(s))
-            })
-            .map(|entry| entry.clone().into_path())
+            .filter(|entry| entry.path().to_str().map_or(false, |s| pattern.is_match(s)))
+            .map(|entry| entry.clone().into_path()),
     );
 }
 
-/// 計算單一資料夾的大小（以位元組為單位）
+/// 計算指定資料夾的總大小（以位元組為單位）。
+/// 遞迴地遍歷資料夾中的所有檔案，並平行處理以提高效率。
+///
+/// # 參數
+/// * `path` - 要計算大小的資料夾路徑。
+///
+/// # 回傳值
+/// * `Result<usize, std::io::Error>` - 成功時回傳檔案總大小（位元組），否則回傳 I/O 錯誤。
 pub fn get_folder_size(path: &Path) -> Result<usize, std::io::Error> {
-    let mut size = 0;
-    let mut queue = VecDeque::new();
-    queue.push_back(path.to_path_buf());
-
-    while let Some(current) = queue.pop_front() {
-        for entry in fs::read_dir(current)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                if let Ok(metadata) = fs::metadata(&path) {
-                    size += metadata.len() as usize;
-                }
-            } else if path.is_dir() {
-                queue.push_back(path);
-            }
-        }
-    }
-
-    Ok(size)
+    Ok(WalkDir::new(path)
+        .into_iter()
+        .par_bridge()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len() as usize)
+        .sum())
 }
 
-/// 計算多個資料夾的總大小
+/// 計算多個資料夾的總大小（以位元組為單位）。
+/// 對每個資料夾使用 `get_folder_size` 並平行執行以提高效能。
+///
+/// # 參數
+/// * `folders` - 一組資料夾路徑。
+///
+/// # 回傳值
+/// * `usize` - 所有資料夾中檔案的總大小（位元組）。
 pub fn calculate_folders_size(folders: &[PathBuf]) -> usize {
-    let total = Arc::new(AtomicUsize::new(0));
-
-    folders.par_iter().for_each(|folder| {
-        if let Ok(size) = get_folder_size(folder) {
-            total.fetch_add(size, Ordering::Relaxed);
-        }
-    });
-
-    total.load(Ordering::Relaxed)
+    folders.par_iter()
+        .filter_map(|folder| get_folder_size(folder).ok())
+        .sum()
 }
 
 /// 將位元組格式化為人類可讀的單位（KB、MB、GB）

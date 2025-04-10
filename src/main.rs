@@ -49,7 +49,7 @@ fn main() {
 
     collect_matching_folders(Path::new(&folder), &pattern, &mut to_delete);
 
-    let scan_elapsed = scan_start.elapsed();
+
 
     if to_delete.is_empty() {
         println!("✅ 沒有找到要刪除的資料夾。");
@@ -58,8 +58,9 @@ fn main() {
 
     // 計算所有資料夾的大小
     let total_size = calculate_folders_size(&to_delete);
-    let size_str = format_size(total_size);
-
+    let size_str = format_size(total_size as usize);
+    let scan_elapsed = scan_start.elapsed();
+    
     println!(
         "📋 預計刪除以下 {} 個資料夾，共 {}（掃描耗時：{:.2?}）：",
         to_delete.len(),
