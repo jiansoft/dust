@@ -1,10 +1,16 @@
 [package]
 name = "dust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+
+build = "build.rs"
 
 [dependencies]
 regex = "1"
 dialoguer = "0.11"
 clap = { version = "4.5.35", features = ["derive"] }
 rayon = "1.10.0"
+walkdir = "2.5"
+
+[build-dependencies]
+embed-resource = "3.0"

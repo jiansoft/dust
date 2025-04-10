@@ -9,47 +9,50 @@ use std::{
         Arc,
     },
 };
+use walkdir::WalkDir;
 
-/// 遞迴搜尋符合指定模式（如 bin、obj、node_modules）的資料夾。
+/// 遞迴搜尋符合指定模式的資料夾（例如 `bin/`、`obj/`、`node_modules/`）
 ///
-/// 此函式會以廣度優先（BFS）方式遍歷指定路徑下所有子資料夾，
-/// 並將所有符合 `pattern` 的資料夾路徑加入 `result` 向量中。
+/// 此函式使用 [`walkdir`] 搭配 [`rayon`] 進行平行遍歷，可快速掃描大量檔案系統結構，
+/// 將所有符合 `pattern` 的資料夾路徑加入 `result` 向量中。
 ///
 /// # 參數
-/// - `path`: 根目錄的路徑參考
-/// - `pattern`: 用於比對資料夾名稱的正規表示式
-/// - `result`: 儲存符合條件的資料夾路徑清單
+/// - `path`: 掃描的根目錄
+/// - `pattern`: 用來比對資料夾路徑的正規表示式
+/// - `result`: 儲存符合條件的資料夾清單（會被修改）
 ///
 /// # 範例
-/// ```rust
-/// let mut result = Vec::new();
-/// let pattern = Regex::new(r"(?i)([/\\])(bin|obj|node_modules)$").unwrap();
-/// collect_matching_folders(Path::new("D:/Projects"), &pattern, &mut result);
+/// ```
+/// let mut folders = Vec::new();
+/// let pattern = Regex::new(r"(?i)[/\\](bin|obj|node_modules)$").unwrap();
+/// collect_matching_folders(Path::new("/my/project"), &pattern, &mut folders);
 /// ```
 ///
-/// # 注意
-/// - 只會收集資料夾（目錄），不處理檔案。
-/// - 使用 BFS 實作，避免遞迴爆棧。
+/// # 注意事項
+/// - 僅搜尋目錄（不包含檔案）
+/// - 使用 rayon 平行處理，需將 result 設為 thread-safe 型別（目前假設使用外層保證）
+/// - 本函式不會進行刪除，僅收集資料夾路徑
+///
+/// # 相依套件
+/// - `walkdir`: 用於遞迴列出所有檔案與目錄
+/// - `rayon`: 用於平行處理大量目錄
 pub fn collect_matching_folders(path: &Path, pattern: &Regex, result: &mut Vec<PathBuf>) {
-    let mut queue = VecDeque::new();
-    queue.push_back(path.to_path_buf());
+    let dirs: Vec<_> = WalkDir::new(path)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir())
+        .collect();
 
-    while let Some(current) = queue.pop_front() {
-        if let Ok(entries) = fs::read_dir(&current) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(path_str) = path.to_str() {
-                        if pattern.is_match(path_str) {
-                            result.push(path);
-                            continue;
-                        }
-                    }
-                    queue.push_back(path);
-                }
-            }
-        }
-    }
+    result.par_extend(
+        dirs.par_iter()
+            .filter(|entry| {
+                entry.path()
+                    .to_str()
+                    .map_or(false, |s| pattern.is_match(s))
+            })
+            .map(|entry| entry.clone().into_path())
+    );
 }
 
 /// 計算單一資料夾的大小（以位元組為單位）
