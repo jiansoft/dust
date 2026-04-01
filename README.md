@@ -1,42 +1,165 @@
-# 🧹 dust
+# dust
 
-一個用來掃描並刪除目錄中常見的編譯暫存資料夾（`bin`、`obj`、`node_modules`）的 CLI 小工具。
+[English](./README.md) | [繁體中文](./README.zh-TW.md)
 
-支援：
-- 提供資料夾路徑作為參數（如 `dust D:\Project\MyApp`）
-- 若未指定路徑，將自動提示用戶輸入
+`dust` is a CLI tool that scans a directory and removes common build artifacts, cache folders, and generated binaries that should not be committed to version control.
 
-## 🧰 功能特色
+It is designed for quickly cleaning large workspaces containing projects written in C#, Node.js, Rust, and Zig.
 
-- 🔍 遞迴掃描資料夾
-- 🧼 刪除 `bin` / `obj` / `node_modules` 資料夾
-- 🤖 支援互動式輸入資料夾路徑
-- 🚀 適合開發者快速清理大量專案暫存
+## Features
 
-## 📦 安裝方式
+- Recursively scans a target directory
+- Supports both command-line path input and interactive prompt input
+- Shows all matched items before deletion
+- Requires confirmation before removing anything
+- Supports `--dry-run` for safe previewing
+- Supports repeated `--exclude` glob filters to protect paths you do not want to touch
+- Supports `--yes` for non-interactive cleanup
+- Supports `--dirs-only` and `--files-only` scan modes
+- Supports `--json` output for scripts and CI
+- Supports `--quiet` to suppress normal console output
+- Supports `--no-progress` to disable the delete progress bar
+- Shows a real delete progress bar with percentage, current target, and current path summary
+- Supports `--progress-style soft|minimal`
+- Cleans common build folders and generated files across multiple languages
 
-1. 安裝 Rust 工具鏈（如果尚未安裝）：
-    ```bash
-    https://rustup.rs
-    ```
+## Supported Cleanup Targets
 
-2. Clone 本專案並建置：
-    ```bash
-    git clone https://github.com/jiansoft/dust.git
-    cd dust
-    cargo build --release
-    ```
+### Directories
 
-3. 將可執行檔複製到 PATH：
-    ```bash
-    cp target/release/dust ~/.cargo/bin/
-    ```
+- `bin`
+- `obj`
+- `node_modules`
+- `target`
+- `zig-cache`
+- `.zig-cache`
+- `zig-out`
+- `log`
+- `logs`
 
-## 🚀 使用方式
+### Files
+
+- `*.pdb`
+- `*.ilk`
+- `*.o`
+- `*.obj`
+- `*.so`
+- `*.a`
+- `*.lib`
+- `*.dll`
+- `*.exe`
+- `*.wasm`
+
+### Special handling for `log` and `logs`
+
+- Only files ending in `.log` or `.txt` are removed
+- The `log` or `logs` directory itself is removed only when no files remain inside it
+
+## Installation
+
+### Prerequisites
+
+Install Rust first if it is not already available on your machine:
 
 ```bash
-# 傳入路徑參數
-dust D:\Project\MyApp
+https://rustup.rs
+```
 
-# 或互動式輸入
+### Build from Source
+
+```bash
+git clone https://github.com/jiansoft/dust.git
+cd dust
+cargo build --release
+```
+
+### Add to PATH
+
+```bash
+cp target/release/dust ~/.cargo/bin/
+```
+
+## Usage
+
+### Scan a specific path
+
+```bash
+dust D:\Project\MyApp
+```
+
+### Use interactive input
+
+```bash
 dust
+```
+
+When no path is provided, the program returns to the prompt after each cleanup run. Enter `q`, `quit`, `exit`, or submit an empty value to stop.
+
+### Preview without deleting
+
+```bash
+dust . --dry-run
+```
+
+### Skip confirmation
+
+```bash
+dust . --yes
+```
+
+### Exclude paths
+
+```bash
+dust . --exclude '**/vendor/**' --exclude '**/third_party/**'
+```
+
+### Remove directories only
+
+```bash
+dust . --dirs-only
+```
+
+### Remove files only
+
+```bash
+dust . --files-only
+```
+
+### JSON output
+
+```bash
+dust . --dry-run --json
+```
+
+### Quiet mode
+
+```bash
+dust . --yes --quiet
+```
+
+### Disable progress bar
+
+```bash
+dust . --yes --no-progress
+```
+
+### Progress style
+
+```bash
+dust . --yes --progress-style soft
+dust . --yes --progress-style minimal
+```
+
+`soft` is heavier and more descriptive. `minimal` is lighter and quieter.
+
+After scanning, `dust` prints the folders and files that will be removed. By default it asks for confirmation before deletion.
+
+## Typical Use Cases
+
+- Clean mixed-language monorepos before archiving or sharing
+- Remove local build artifacts before checking git status
+- Reclaim disk space in development workspaces
+
+## License
+
+MIT
