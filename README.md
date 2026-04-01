@@ -15,6 +15,7 @@ It is designed for quickly cleaning large workspaces containing projects written
 - Requires confirmation before removing anything
 - Supports `--dry-run` for safe previewing
 - Supports repeated `--exclude` glob filters to protect paths you do not want to touch
+- Skips common metadata and protected folders by default for faster and safer scans, including `.git`, `.idea`, `.vscode`, `coverage`, `deploy`, and `rustdoc` generated documentation output
 - Supports `--yes` for non-interactive cleanup
 - Supports `--dirs-only` and `--files-only` scan modes
 - Supports `--json` output for scripts and CI
@@ -50,6 +51,8 @@ It is designed for quickly cleaning large workspaces containing projects written
 - `*.dll`
 - `*.exe`
 - `*.wasm`
+
+Generated binary files such as `*.exe`, `*.dll`, `*.so`, `*.a`, `*.lib`, and `*.wasm` are only removed when they are located under known build-output directories such as `target`, `bin`, `obj`, `zig-out`, `zig-cache`, or `.zig-cache`.
 
 ### Special handling for `log` and `logs`
 
