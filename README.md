@@ -58,6 +58,7 @@ Generated binary files such as `*.exe`, `*.dll`, `*.so`, `*.a`, `*.lib`, and `*.
 
 - Only files ending in `.log` or `.txt` are removed
 - The `log` or `logs` directory itself is removed only when no files remain inside it
+- If the current scan root is itself named `log` or `logs`, it is also listed as a cleanup target when matching files are present
 
 ## Installation
 
@@ -161,6 +162,7 @@ When no path is provided, `dust` first asks for an initial directory and then op
 - Windows: you can start from available drives, the current directory, the home directory, or the last selected directory
 - Unix/macOS: you can start from `/`, the current directory, the home directory, or the last selected directory
 - Inside the TUI, browse directories, switch roots, preview planned deletions, clean, or quit
+- In the default interactive preview, `dust` focuses on directory-like targets; use `--files-only` if you want the preview to list grouped removable files instead
 
 After each cleanup run, the TUI is shown again so you can continue working without restarting the tool.
 
