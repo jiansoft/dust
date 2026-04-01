@@ -10,6 +10,7 @@ It is designed for quickly cleaning large workspaces containing projects written
 
 - Recursively scans a target directory
 - Supports both command-line path input and interactive prompt input
+- Supports a full-screen interactive TUI directory browser
 - Shows all matched items before deletion
 - Requires confirmation before removing anything
 - Supports `--dry-run` for safe previewing
@@ -79,6 +80,61 @@ cargo build --release
 cp target/release/dust ~/.cargo/bin/
 ```
 
+## Build Scripts
+
+This repository includes helper scripts for local builds:
+
+- [build.sh](./build.sh) for Unix, Linux, and macOS
+- [build.bat](./build.bat) for Windows
+
+### Default build
+
+Unix / macOS / Linux:
+
+```bash
+./build.sh
+```
+
+Windows:
+
+```bat
+build.bat
+```
+
+Both scripts build `dust` in `release` mode by default and verify that the output binary exists.
+
+### Build with a different profile
+
+Unix / macOS / Linux:
+
+```bash
+PROFILE=debug ./build.sh
+```
+
+Windows:
+
+```bat
+set PROFILE=debug
+build.bat
+```
+
+### Build specific targets
+
+Unix / macOS / Linux:
+
+```bash
+TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-gnu" ./build.sh
+```
+
+Windows:
+
+```bat
+set TARGETS=aarch64-unknown-linux-musl x86_64-pc-windows-msvc
+build.bat
+```
+
+When `TARGETS` is set, the scripts call `rustup target add` before building each target.
+
 ## Usage
 
 ### Scan a specific path
@@ -93,7 +149,17 @@ dust D:\Project\MyApp
 dust
 ```
 
-When no path is provided, the program returns to the prompt after each cleanup run. Enter `q`, `quit`, `exit`, or submit an empty value to stop.
+When no path is provided, `dust` first asks for an initial directory and then opens a full-screen interactive TUI browser.
+
+- Press `Enter` on an empty prompt to start from the current working directory
+- Enter a Windows path such as `D:\Project\MyApp` or a Unix path such as `/home/user/project`
+- Relative paths are also accepted if they resolve to a directory
+
+- Windows: you can start from available drives, the current directory, the home directory, or the last selected directory
+- Unix/macOS: you can start from `/`, the current directory, the home directory, or the last selected directory
+- Inside the TUI, browse directories, switch roots, preview planned deletions, clean, or quit
+
+After each cleanup run, the TUI is shown again so you can continue working without restarting the tool.
 
 ### Preview without deleting
 

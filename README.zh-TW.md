@@ -10,6 +10,7 @@
 
 - 遞迴掃描指定目錄
 - 支援命令列傳入路徑或互動式輸入
+- 支援全螢幕互動式 TUI 目錄瀏覽介面
 - 刪除前會先列出所有符合的項目
 - 執行刪除前會要求確認
 - 支援 `--dry-run` 安全預覽
@@ -79,6 +80,61 @@ cargo build --release
 cp target/release/dust ~/.cargo/bin/
 ```
 
+## Build Scripts
+
+此專案內含兩個方便的建置腳本：
+
+- [build.sh](./build.sh)：給 Unix、Linux、macOS 使用
+- [build.bat](./build.bat)：給 Windows 使用
+
+### 預設建置
+
+Unix / macOS / Linux：
+
+```bash
+./build.sh
+```
+
+Windows：
+
+```bat
+build.bat
+```
+
+兩個腳本預設都會用 `release` 模式建置，並確認輸出執行檔確實存在。
+
+### 指定不同的 profile
+
+Unix / macOS / Linux：
+
+```bash
+PROFILE=debug ./build.sh
+```
+
+Windows：
+
+```bat
+set PROFILE=debug
+build.bat
+```
+
+### 建置指定 target
+
+Unix / macOS / Linux：
+
+```bash
+TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-gnu" ./build.sh
+```
+
+Windows：
+
+```bat
+set TARGETS=aarch64-unknown-linux-musl x86_64-pc-windows-msvc
+build.bat
+```
+
+當有設定 `TARGETS` 時，腳本會先執行 `rustup target add`，再依序建置各 target。
+
 ## 使用方式
 
 ### 掃描指定路徑
@@ -93,7 +149,18 @@ dust D:\Project\MyApp
 dust
 ```
 
-未傳入路徑時，程式會在每次清理完成後回到輸入提示；輸入 `q`、`quit`、`exit` 或直接送出空白即可結束。
+未傳入路徑時，`dust` 會先要求輸入一個初始路徑，再開啟全螢幕互動式 TUI 目錄瀏覽介面。
+
+- 在提示直接按 `Enter`，會使用目前工作目錄作為初始路徑
+- 可輸入 Windows 路徑，例如 `D:\Project\MyApp`
+- 也可輸入 Unix 路徑，例如 `/home/user/project`
+- 也接受可解析成資料夾的相對路徑
+
+- Windows：可從可用磁碟機、目前目錄、家目錄或上次選取的目錄開始
+- Unix/macOS：可從 `/`、目前目錄、家目錄或上次選取的目錄開始
+- 在 TUI 中可瀏覽資料夾、切換根路徑、查看預刪摘要、執行清理，或結束程式
+
+每次清理完成後，TUI 會再次顯示，方便持續操作而不必重新啟動程式。
 
 ### 僅預覽，不刪除
 
