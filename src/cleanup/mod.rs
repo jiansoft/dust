@@ -2,14 +2,15 @@
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
+#[cfg(test)]
+use std::io;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
-#[cfg(test)]
-use std::io;
 use walkdir::{IntoIter, WalkDir};
 
 /// Directory names that are commonly used as build outputs, dependency caches,
@@ -218,7 +219,11 @@ impl RemovalTarget {
     }
 
     /// Creates a grouped-file target for removable files that share a parent directory.
-    pub fn new_group(path: PathBuf, size: Option<u64>, grouped_paths: Option<Vec<PathBuf>>) -> Self {
+    pub fn new_group(
+        path: PathBuf,
+        size: Option<u64>,
+        grouped_paths: Option<Vec<PathBuf>>,
+    ) -> Self {
         Self {
             path,
             kind: RemovalKind::FileGroup,
@@ -247,18 +252,6 @@ impl RemovalTarget {
         self.size
     }
 
-    /// Computes the target size from the filesystem according to its kind.
-    pub fn compute_size(&self) -> u64 {
-        match self.kind {
-            RemovalKind::Directory => directory_size(&self.path),
-            RemovalKind::LogDirectory => log_directory_cleanup_size(&self.path),
-            RemovalKind::FileGroup => grouped_file_paths(self)
-                .iter()
-                .map(|path| file_size(path))
-                .sum(),
-        }
-    }
-
     /// Updates the cached size stored on this target.
     pub fn set_size(&mut self, size: u64) {
         self.size = Some(size);
@@ -278,8 +271,8 @@ impl RemovalTarget {
             RemovalKind::Directory => collect_directory_delete_operations(&self.path),
             RemovalKind::LogDirectory => collect_log_directory_delete_operations(&self.path),
             RemovalKind::FileGroup => grouped_file_paths(self)
-                .into_iter()
-                .map(|path| DeleteOperation::new(path, DeleteAction::DeleteFile))
+                .iter()
+                .map(|path| DeleteOperation::new(path.to_path_buf(), DeleteAction::DeleteFile))
                 .collect(),
         }
     }
@@ -292,6 +285,13 @@ pub struct TargetContentStats {
     pub file_count: usize,
     /// Number of subdirectories contained in the target.
     pub dir_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LogDirectorySummary {
+    cleanup_size: u64,
+    has_files: bool,
+    has_cleanup_files: bool,
 }
 
 /// Collects matching cleanup targets and computes their sizes eagerly.
@@ -318,27 +318,28 @@ fn removable_directory_target(
 
     if matches_name(path.file_name(), DIRECTORY_NAMES) {
         return Some(if with_size {
-            RemovalTarget::new(path.to_path_buf(), RemovalKind::Directory, directory_size(path))
+            RemovalTarget::new(
+                path.to_path_buf(),
+                RemovalKind::Directory,
+                directory_size(path),
+            )
         } else {
             RemovalTarget::new_unsized(path.to_path_buf(), RemovalKind::Directory)
         });
     }
 
     if matches_name(path.file_name(), LOG_DIRECTORY_NAMES) {
-        if with_size {
-            let size = log_directory_cleanup_size(path);
-            if size > 0 || directory_has_no_files(path) {
-                return Some(RemovalTarget::new(
+        let summary = log_directory_summary(path);
+        if summary.has_cleanup_files || !summary.has_files {
+            return Some(if with_size {
+                RemovalTarget::new(
                     path.to_path_buf(),
                     RemovalKind::LogDirectory,
-                    size,
-                ));
-            }
-        } else if log_directory_has_cleanup_work(path) {
-            return Some(RemovalTarget::new_unsized(
-                path.to_path_buf(),
-                RemovalKind::LogDirectory,
-            ));
+                    summary.cleanup_size,
+                )
+            } else {
+                RemovalTarget::new_unsized(path.to_path_buf(), RemovalKind::LogDirectory)
+            });
         }
     }
 
@@ -351,10 +352,10 @@ fn collect_cleanup_targets_with_size(
     config: &ScanConfig,
     with_size: bool,
 ) -> Vec<RemovalTarget> {
-    if !config.is_excluded(root) {
-        if let Some(target) = removable_directory_target(root, config.mode(), with_size) {
-            return vec![target];
-        }
+    if !config.is_excluded(root)
+        && let Some(target) = removable_directory_target(root, config.mode(), with_size)
+    {
+        return vec![target];
     }
 
     let mut targets = Vec::new();
@@ -389,12 +390,10 @@ fn collect_cleanup_targets_with_size(
             continue;
         }
 
-        if is_dir {
-            if let Some(target) = removable_directory_target(path, config.mode(), with_size) {
-                targets.push(target);
-                iter.skip_current_dir();
-                continue;
-            }
+        if is_dir && let Some(target) = removable_directory_target(path, config.mode(), with_size) {
+            targets.push(target);
+            iter.skip_current_dir();
+            continue;
         }
 
         if is_dir && matches_name(path.file_name(), LOG_DIRECTORY_NAMES) {
@@ -422,7 +421,7 @@ fn collect_cleanup_targets_with_size(
         }
 
         if is_dir {
-            build_context_stack.push(inside_build_dir);
+            build_context_stack.push(inside_build_dir || should_remove_dir(path));
         }
     }
 
@@ -444,11 +443,23 @@ pub fn calculate_entries_size(entries: &[RemovalTarget]) -> u64 {
     entries.iter().map(RemovalTarget::size).sum()
 }
 
-/// Counts the files and folders contained by a target.
-pub fn summarize_target_contents(target: &RemovalTarget) -> TargetContentStats {
-    match target.kind() {
+/// Computes a target size from a path and removal kind.
+pub fn compute_target_size_for_path(path: &Path, kind: RemovalKind) -> u64 {
+    match kind {
+        RemovalKind::Directory => directory_size(path),
+        RemovalKind::LogDirectory => log_directory_summary(path).cleanup_size,
+        RemovalKind::FileGroup => collect_grouped_file_paths(path)
+            .iter()
+            .map(|entry_path| file_size(entry_path))
+            .sum(),
+    }
+}
+
+/// Counts the files and folders contained by a target path and kind.
+pub fn summarize_target_contents_for_path(path: &Path, kind: RemovalKind) -> TargetContentStats {
+    match kind {
         RemovalKind::Directory | RemovalKind::LogDirectory => {
-            let iter: IntoIter = WalkDir::new(target.path()).min_depth(1).into_iter();
+            let iter: IntoIter = WalkDir::new(path).min_depth(1).into_iter();
             let mut file_count = 0usize;
             let mut dir_count = 0usize;
 
@@ -466,7 +477,7 @@ pub fn summarize_target_contents(target: &RemovalTarget) -> TargetContentStats {
             }
         }
         RemovalKind::FileGroup => TargetContentStats {
-            file_count: grouped_file_paths(target).len(),
+            file_count: collect_grouped_file_paths(path).len(),
             dir_count: 0,
         },
     }
@@ -532,24 +543,24 @@ fn matches_name(name: Option<&OsStr>, candidates: &[&str]) -> bool {
 }
 
 /// Returns the concrete file paths represented by a grouped-file target.
-fn grouped_file_paths(target: &RemovalTarget) -> Vec<PathBuf> {
-    target
-        .grouped_paths
-        .clone()
-        .unwrap_or_else(|| collect_grouped_file_paths(&target.path))
+fn grouped_file_paths(target: &RemovalTarget) -> Cow<'_, [PathBuf]> {
+    match target.grouped_paths.as_deref() {
+        Some(paths) => Cow::Borrowed(paths),
+        None => Cow::Owned(collect_grouped_file_paths(&target.path)),
+    }
 }
 
 /// Collects removable files directly contained in the given directory.
 fn collect_grouped_file_paths(path: &Path) -> Vec<PathBuf> {
-    let inside_build_dir = path
-        .ancestors()
-        .any(|ancestor| should_remove_dir(ancestor));
+    let inside_build_dir = path.ancestors().any(should_remove_dir);
 
     fs::read_dir(path)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|entry_path| entry_path.is_file() && should_remove_file(entry_path, inside_build_dir))
+        .filter(|entry_path| {
+            entry_path.is_file() && should_remove_file(entry_path, inside_build_dir)
+        })
         .collect()
 }
 
@@ -568,31 +579,25 @@ fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
-/// Sums the sizes of cleanup-eligible files within a log directory.
-fn log_directory_cleanup_size(path: &Path) -> u64 {
+/// Scans a log directory once and records removable size and file presence.
+fn log_directory_summary(path: &Path) -> LogDirectorySummary {
     let iter: IntoIter = WalkDir::new(path).into_iter();
-    iter.filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|entry_path| should_remove_log_file(entry_path))
-        .map(|entry_path| file_size(&entry_path))
-        .sum()
-}
+    let mut summary = LogDirectorySummary::default();
 
-/// Returns whether a directory contains no files at any depth.
-fn directory_has_no_files(path: &Path) -> bool {
-    let iter: IntoIter = WalkDir::new(path).min_depth(1).into_iter();
-    !iter.filter_map(|entry| entry.ok()).any(|entry| entry.file_type().is_file())
-}
+    for entry in iter.filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
 
-/// Returns whether a log directory has any cleanup work available.
-fn log_directory_has_cleanup_work(path: &Path) -> bool {
-    let iter: IntoIter = WalkDir::new(path).into_iter();
-    iter.filter_map(|entry| entry.ok()).any(|entry| {
+        summary.has_files = true;
         let entry_path = entry.path();
-        (entry.file_type().is_file() && should_remove_log_file(entry_path))
-            || (entry_path == path && directory_has_no_files(path))
-    })
+        if should_remove_log_file(entry_path) {
+            summary.has_cleanup_files = true;
+            summary.cleanup_size += entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        }
+    }
+
+    summary
 }
 
 #[cfg(test)]
@@ -773,6 +778,30 @@ mod tests {
     }
 
     #[test]
+    fn files_only_mode_keeps_build_directory_context_for_nested_outputs() {
+        let root =
+            create_temp_dir("files_only_mode_keeps_build_directory_context_for_nested_outputs");
+        let target_exe = root
+            .join("project")
+            .join("target")
+            .join("bin")
+            .join("app.exe");
+        write_file(&target_exe, b"1234");
+
+        let config = ScanConfig::new(&[], ScanMode::FilesOnly).unwrap();
+        let results = collect_cleanup_targets_fast(&root, &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].path(),
+            root.join("project").join("target").join("bin")
+        );
+        assert_eq!(results[0].kind(), RemovalKind::FileGroup);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn removable_files_in_same_directory_are_grouped() {
         let root = create_temp_dir("removable_files_in_same_directory_are_grouped");
         let build_dir = root.join("project").join("artifacts");
@@ -832,7 +861,8 @@ mod tests {
 
     #[test]
     fn scanning_inside_log_directory_returns_current_directory_as_target() {
-        let root = create_temp_dir("scanning_inside_log_directory_returns_current_directory_as_target");
+        let root =
+            create_temp_dir("scanning_inside_log_directory_returns_current_directory_as_target");
         let logs_dir = root.join("log");
         fs::create_dir_all(&logs_dir).unwrap();
         write_file(&logs_dir.join("app.log"), b"1234");
@@ -896,7 +926,8 @@ mod tests {
             Some(target_dir.as_path())
         );
         assert!(operations.iter().any(|operation| {
-            operation.path() == nested_dir.join("app.exe") && operation.action() == DeleteAction::DeleteFile
+            operation.path() == nested_dir.join("app.exe")
+                && operation.action() == DeleteAction::DeleteFile
         }));
 
         fs::remove_dir_all(root).unwrap();
@@ -914,9 +945,14 @@ mod tests {
         let operations = target.delete_operations();
 
         assert!(operations.iter().any(|operation| {
-            operation.path() == logs_dir.join("app.log") && operation.action() == DeleteAction::DeleteFile
+            operation.path() == logs_dir.join("app.log")
+                && operation.action() == DeleteAction::DeleteFile
         }));
-        assert!(!operations.iter().any(|operation| operation.path() == logs_dir.join("keep.json")));
+        assert!(
+            !operations
+                .iter()
+                .any(|operation| operation.path() == logs_dir.join("keep.json"))
+        );
         assert_eq!(
             operations.last().map(DeleteOperation::action),
             Some(DeleteAction::DeleteDirectoryIfEmpty)

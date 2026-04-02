@@ -3,7 +3,8 @@
 use crate::app::{execute_removal, scan_mode_from_cli};
 use crate::cleanup::{
     RemovalKind, RemovalTarget, ScanConfig, ScanMode, TargetContentStats,
-    collect_cleanup_targets_fast, format_size, summarize_target_contents,
+    collect_cleanup_targets_fast, compute_target_size_for_path, format_size,
+    summarize_target_contents_for_path,
 };
 use crate::cli::Cli;
 use crossterm::{
@@ -31,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const COLOR_ACCENT: Color = Color::Rgb(10, 132, 255);
@@ -148,6 +149,13 @@ enum PreviewScanUpdate {
     },
 }
 
+/// Lightweight size work kept by the preview thread after targets are sent to the UI.
+struct PreviewSizeJob {
+    index: usize,
+    path: PathBuf,
+    kind: RemovalKind,
+}
+
 /// Messages sent from the selected-entry stats worker to the UI thread.
 enum SelectedStatsUpdate {
     /// Content counts for the currently selected target are ready.
@@ -158,16 +166,42 @@ enum SelectedStatsUpdate {
     },
 }
 
+#[derive(Default)]
+struct PreviewRenderCache {
+    width: usize,
+    revision: u64,
+    items: Vec<RenderedPreviewItem>,
+}
+
+enum RenderedPreviewItem {
+    Single(String),
+    Compact { label: String, size: String },
+}
+
+impl RenderedPreviewItem {
+    fn to_list_item(&self) -> ListItem<'_> {
+        match self {
+            Self::Single(line) => ListItem::new(line.as_str()),
+            Self::Compact { label, size } => {
+                ListItem::new(vec![Line::from(label.as_str()), Line::from(size.as_str())])
+            }
+        }
+    }
+}
+
 /// Mutable state for the entire interactive session.
 struct TuiState {
     mode: TuiMode,
     current_dir: PathBuf,
     last_dir: Option<PathBuf>,
     browser_actions: Vec<BrowserAction>,
+    browser_actions_dir: Option<PathBuf>,
     browser_index: usize,
     roots: Vec<BrowserRoot>,
     root_index: usize,
     preview_targets: Vec<RemovalTarget>,
+    preview_render_cache: PreviewRenderCache,
+    preview_render_revision: u64,
     preview_index: usize,
     preview_total_size: u64,
     preview_found_elapsed: std::time::Duration,
@@ -175,11 +209,11 @@ struct TuiState {
     preview_status: PreviewStatus,
     preview_scan_rx: Option<Receiver<PreviewScanUpdate>>,
     preview_scan_id: u64,
-    preview_scan_mode: ScanMode,
     selected_stats_cache: HashMap<PathBuf, TargetContentStats>,
     selected_stats_rx: Option<Receiver<SelectedStatsUpdate>>,
     selected_stats_request_id: u64,
     selected_stats_path: Option<PathBuf>,
+    needs_redraw: bool,
 }
 
 impl TuiState {
@@ -191,10 +225,13 @@ impl TuiState {
             current_dir,
             last_dir: None,
             browser_actions: Vec::new(),
+            browser_actions_dir: None,
             browser_index: 0,
             roots: Vec::new(),
             root_index: 0,
             preview_targets: Vec::new(),
+            preview_render_cache: PreviewRenderCache::default(),
+            preview_render_revision: 0,
             preview_index: 0,
             preview_total_size: 0,
             preview_found_elapsed: std::time::Duration::from_secs(0),
@@ -202,12 +239,24 @@ impl TuiState {
             preview_status: PreviewStatus::Ready,
             preview_scan_rx: None,
             preview_scan_id: 0,
-            preview_scan_mode: ScanMode::All,
             selected_stats_cache: HashMap::new(),
             selected_stats_rx: None,
             selected_stats_request_id: 0,
             selected_stats_path: None,
+            needs_redraw: true,
         }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    fn invalidate_browser_actions(&mut self) {
+        self.browser_actions_dir = None;
+    }
+
+    fn invalidate_preview_render_cache(&mut self) {
+        self.preview_render_revision = self.preview_render_revision.wrapping_add(1);
     }
 }
 
@@ -218,15 +267,36 @@ fn run_tui_loop(
     state: &mut TuiState,
 ) -> Result<(), Box<dyn Error>> {
     state.roots = browser_roots(state.last_dir.as_deref());
+    state.mark_dirty();
+    let mut last_draw = Instant::now()
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or_else(Instant::now);
 
     loop {
-        process_preview_scan(state);
-        process_selected_stats(state);
+        if process_preview_scan(state) {
+            state.mark_dirty();
+        }
+        if process_selected_stats(state) {
+            state.mark_dirty();
+        }
         request_selected_stats_if_needed(state);
         refresh_browser_actions(state)?;
-        terminal.draw(|frame| draw_tui(frame, state))?;
+        let preview_animating = should_animate_preview(state);
+        let tick = Duration::from_millis(if preview_animating { 100 } else { 250 });
+        let should_draw = state.needs_redraw
+            || (preview_animating && last_draw.elapsed() >= Duration::from_millis(100));
 
-        if !event::poll(std::time::Duration::from_millis(100))? {
+        if should_draw {
+            if matches!(state.mode, TuiMode::Preview) {
+                let width = preview_list_width(terminal.size()?.into());
+                prepare_preview_render_cache(state, width);
+            }
+            terminal.draw(|frame| draw_tui(frame, state))?;
+            state.needs_redraw = false;
+            last_draw = Instant::now();
+        }
+
+        if !event::poll(tick)? {
             continue;
         }
 
@@ -274,13 +344,42 @@ fn run_tui_loop(
     }
 }
 
+fn should_animate_preview(state: &TuiState) -> bool {
+    matches!(state.mode, TuiMode::Preview)
+        && matches!(
+            state.preview_status,
+            PreviewStatus::Scanning { .. } | PreviewStatus::CalculatingSize { .. }
+        )
+}
+
+fn set_current_dir(state: &mut TuiState, path: PathBuf) {
+    if state.current_dir != path {
+        state.current_dir = path;
+        state.invalidate_browser_actions();
+    }
+    state.browser_index = 0;
+    state.mark_dirty();
+}
+
+fn open_root_selector(state: &mut TuiState) {
+    state.roots = browser_roots(Some(&state.current_dir));
+    state.root_index = 0;
+    state.mode = TuiMode::RootSelect;
+    state.mark_dirty();
+}
+
 /// Handles key input while browsing directories.
-fn handle_browse_key(key: KeyCode, state: &mut TuiState, cli: &Cli) -> Result<bool, Box<dyn Error>> {
+fn handle_browse_key(
+    key: KeyCode,
+    state: &mut TuiState,
+    cli: &Cli,
+) -> Result<bool, Box<dyn Error>> {
     match key {
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.browser_actions.is_empty() {
                 state.browser_index = (state.browser_index + 1) % state.browser_actions.len();
+                state.mark_dirty();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -290,39 +389,29 @@ fn handle_browse_key(key: KeyCode, state: &mut TuiState, cli: &Cli) -> Result<bo
                 } else {
                     state.browser_index - 1
                 };
+                state.mark_dirty();
             }
         }
         KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
             if let Some(parent) = state.current_dir.parent() {
-                state.current_dir = parent.to_path_buf();
-                state.browser_index = 0;
+                set_current_dir(state, parent.to_path_buf());
             }
         }
-        KeyCode::Char('r') => {
-            state.roots = browser_roots(Some(&state.current_dir));
-            state.root_index = 0;
-            state.mode = TuiMode::RootSelect;
-        }
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match state.browser_actions.get(state.browser_index) {
-            Some(BrowserAction::UseCurrent) => build_preview(state, cli)?,
-            Some(BrowserAction::GoUp) => {
-                if let Some(parent) = state.current_dir.parent() {
-                    state.current_dir = parent.to_path_buf();
-                    state.browser_index = 0;
+        KeyCode::Char('r') => open_root_selector(state),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            match state.browser_actions.get(state.browser_index) {
+                Some(BrowserAction::UseCurrent) => build_preview(state, cli)?,
+                Some(BrowserAction::GoUp) => {
+                    if let Some(parent) = state.current_dir.parent() {
+                        set_current_dir(state, parent.to_path_buf());
+                    }
                 }
+                Some(BrowserAction::ChangeRoot) => open_root_selector(state),
+                Some(BrowserAction::Enter(path)) => set_current_dir(state, path.clone()),
+                Some(BrowserAction::Quit) => return Ok(true),
+                None => {}
             }
-            Some(BrowserAction::ChangeRoot) => {
-                state.roots = browser_roots(Some(&state.current_dir));
-                state.root_index = 0;
-                state.mode = TuiMode::RootSelect;
-            }
-            Some(BrowserAction::Enter(path)) => {
-                state.current_dir = path.clone();
-                state.browser_index = 0;
-            }
-            Some(BrowserAction::Quit) => return Ok(true),
-            None => {}
-        },
+        }
         _ => {}
     }
     Ok(false)
@@ -331,13 +420,19 @@ fn handle_browse_key(key: KeyCode, state: &mut TuiState, cli: &Cli) -> Result<bo
 /// Handles key input while selecting a root directory.
 fn handle_root_key(key: KeyCode, state: &mut TuiState) -> Result<bool, Box<dyn Error>> {
     match key {
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('b') => {
-            state.mode = TuiMode::Browse
+        KeyCode::Esc
+        | KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Char('h')
+        | KeyCode::Char('b') => {
+            state.mode = TuiMode::Browse;
+            state.mark_dirty();
         }
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.roots.is_empty() {
                 state.root_index = (state.root_index + 1) % state.roots.len();
+                state.mark_dirty();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -347,13 +442,14 @@ fn handle_root_key(key: KeyCode, state: &mut TuiState) -> Result<bool, Box<dyn E
                 } else {
                     state.root_index - 1
                 };
+                state.mark_dirty();
             }
         }
         KeyCode::Enter => {
             if let Some(root) = state.roots.get(state.root_index) {
-                state.current_dir = root.path.clone();
-                state.browser_index = 0;
+                set_current_dir(state, root.path.clone());
                 state.mode = TuiMode::Browse;
+                state.mark_dirty();
             }
         }
         _ => {}
@@ -367,13 +463,16 @@ fn handle_preview_key(key: KeyCode, state: &mut TuiState) -> Result<PreviewActio
         KeyCode::Char('q') => return Ok(PreviewAction::Quit),
         KeyCode::Esc | KeyCode::Char('b') => return Ok(PreviewAction::Back),
         KeyCode::Char('c') => {
-            if matches!(state.preview_status, PreviewStatus::Ready) && !state.preview_targets.is_empty() {
+            if matches!(state.preview_status, PreviewStatus::Ready)
+                && !state.preview_targets.is_empty()
+            {
                 return Ok(PreviewAction::Clean);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.preview_targets.is_empty() {
                 state.preview_index = (state.preview_index + 1) % state.preview_targets.len();
+                state.mark_dirty();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -383,6 +482,7 @@ fn handle_preview_key(key: KeyCode, state: &mut TuiState) -> Result<PreviewActio
                 } else {
                     state.preview_index - 1
                 };
+                state.mark_dirty();
             }
         }
         _ => {}
@@ -409,23 +509,33 @@ fn build_preview(state: &mut TuiState, cli: &Cli) -> Result<(), Box<dyn Error>> 
     state.preview_total_size = 0;
     state.preview_found_elapsed = std::time::Duration::from_secs(0);
     state.preview_scan_elapsed = std::time::Duration::from_secs(0);
-    state.preview_scan_mode = mode;
     state.selected_stats_cache.clear();
     state.selected_stats_rx = None;
     state.selected_stats_path = None;
+    state.invalidate_preview_render_cache();
     state.preview_status = PreviewStatus::Scanning {
         started_at: Instant::now(),
     };
     state.mode = TuiMode::Preview;
+    state.mark_dirty();
 
     thread::spawn(move || {
         let scan_start = Instant::now();
         let targets = collect_cleanup_targets_fast(&path, &config);
+        let size_jobs: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| PreviewSizeJob {
+                index,
+                path: target.path().to_path_buf(),
+                kind: target.kind(),
+            })
+            .collect();
 
         if tx
             .send(PreviewScanUpdate::TargetsFound {
                 scan_id,
-                targets: targets.clone(),
+                targets,
                 scan_elapsed: scan_start.elapsed(),
             })
             .is_err()
@@ -436,15 +546,16 @@ fn build_preview(state: &mut TuiState, cli: &Cli) -> Result<(), Box<dyn Error>> 
         let mut running_total_size = 0u64;
         let mut batch = Vec::new();
         let batch_size = 16usize;
+        let job_count = size_jobs.len();
 
-        for (index, target) in targets.iter().enumerate() {
-            let size = target.compute_size();
+        for (position, job) in size_jobs.into_iter().enumerate() {
+            let size = compute_target_size_for_path(&job.path, job.kind);
             running_total_size += size;
-            batch.push((index, size));
+            batch.push((job.index, size));
 
-            let is_last = index + 1 == targets.len();
+            let is_last = position + 1 == job_count;
             if batch.len() >= batch_size || is_last {
-                let sized_count = index + 1;
+                let sized_count = position + 1;
                 if tx
                     .send(PreviewScanUpdate::SizeBatch {
                         scan_id,
@@ -466,9 +577,10 @@ fn build_preview(state: &mut TuiState, cli: &Cli) -> Result<(), Box<dyn Error>> 
 }
 
 /// Pulls pending preview-scan updates into UI state.
-fn process_preview_scan(state: &mut TuiState) {
+fn process_preview_scan(state: &mut TuiState) -> bool {
     let mut disconnected = false;
     let mut updates = Vec::new();
+    let mut changed = false;
 
     if let Some(rx) = state.preview_scan_rx.as_ref() {
         loop {
@@ -494,11 +606,18 @@ fn process_preview_scan(state: &mut TuiState) {
                 state.preview_found_elapsed = scan_elapsed;
                 state.preview_scan_elapsed = scan_elapsed;
                 state.preview_index = 0;
-                state.preview_status = PreviewStatus::CalculatingSize {
-                    started_at: Instant::now(),
-                    target_count: state.preview_targets.len(),
-                    sized_count: 0,
-                };
+                state.invalidate_preview_render_cache();
+                if state.preview_targets.is_empty() {
+                    state.preview_status = PreviewStatus::Ready;
+                    state.preview_scan_rx = None;
+                } else {
+                    state.preview_status = PreviewStatus::CalculatingSize {
+                        started_at: Instant::now(),
+                        target_count: state.preview_targets.len(),
+                        sized_count: 0,
+                    };
+                }
+                changed = true;
             }
             PreviewScanUpdate::SizeBatch {
                 scan_id,
@@ -513,6 +632,7 @@ fn process_preview_scan(state: &mut TuiState) {
                         target.set_size(size);
                     }
                 }
+                state.invalidate_preview_render_cache();
                 state.preview_total_size = running_total_size;
                 state.preview_scan_elapsed = total_elapsed;
                 if is_complete {
@@ -525,6 +645,7 @@ fn process_preview_scan(state: &mut TuiState) {
                         sized_count,
                     };
                 }
+                changed = true;
             }
             _ => {}
         }
@@ -533,19 +654,27 @@ fn process_preview_scan(state: &mut TuiState) {
     if disconnected && !matches!(state.preview_status, PreviewStatus::Ready) {
         state.preview_scan_rx = None;
         state.preview_status = PreviewStatus::Failed("Scan stopped unexpectedly.".to_string());
+        changed = true;
     }
+
+    changed
 }
 
 /// Pulls pending selected-target content counts into UI state.
-fn process_selected_stats(state: &mut TuiState) {
+fn process_selected_stats(state: &mut TuiState) -> bool {
     let mut updates = Vec::new();
+    let mut changed = false;
+    let mut disconnected = false;
 
     if let Some(rx) = state.selected_stats_rx.as_ref() {
         loop {
             match rx.try_recv() {
                 Ok(update) => updates.push(update),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
     }
@@ -557,14 +686,22 @@ fn process_selected_stats(state: &mut TuiState) {
                 path,
                 stats,
             } if request_id == state.selected_stats_request_id => {
-                state.selected_stats_cache.insert(path.clone(), stats);
-                if state.selected_stats_path.as_ref() == Some(&path) {
+                let is_selected = state.selected_stats_path.as_ref() == Some(&path);
+                state.selected_stats_cache.insert(path, stats);
+                if is_selected {
                     state.selected_stats_rx = None;
                 }
+                changed = true;
             }
             _ => {}
         }
     }
+
+    if disconnected {
+        state.selected_stats_rx = None;
+    }
+
+    changed
 }
 
 /// Starts a background stats request for the currently selected preview target.
@@ -589,7 +726,7 @@ fn request_selected_stats_if_needed(state: &mut TuiState) {
     }
 
     let request_id = state.selected_stats_request_id.wrapping_add(1);
-    let target = entry.clone();
+    let kind = entry.kind();
     let path_clone = path.clone();
     let (tx, rx) = mpsc::channel();
 
@@ -598,7 +735,7 @@ fn request_selected_stats_if_needed(state: &mut TuiState) {
     state.selected_stats_rx = Some(rx);
 
     thread::spawn(move || {
-        let stats = summarize_target_contents(&target);
+        let stats = summarize_target_contents_for_path(&path_clone, kind);
         let _ = tx.send(SelectedStatsUpdate::Ready {
             request_id,
             path: path_clone,
@@ -616,21 +753,27 @@ fn supports_selected_stats(kind: RemovalKind) -> bool {
 fn cancel_preview(state: &mut TuiState) {
     state.preview_scan_rx = None;
     state.preview_targets.clear();
+    state.invalidate_preview_render_cache();
+    state.preview_render_cache.items.clear();
     state.preview_index = 0;
     state.preview_total_size = 0;
     state.preview_found_elapsed = std::time::Duration::from_secs(0);
     state.preview_scan_elapsed = std::time::Duration::from_secs(0);
-    state.preview_scan_mode = ScanMode::All;
     state.selected_stats_cache.clear();
     state.selected_stats_rx = None;
     state.selected_stats_path = None;
     state.preview_status = PreviewStatus::Ready;
     state.mode = TuiMode::Browse;
+    state.mark_dirty();
 }
 
 /// Rebuilds the browse-list actions for the current directory.
 fn refresh_browser_actions(state: &mut TuiState) -> Result<(), Box<dyn Error>> {
     if !matches!(state.mode, TuiMode::Browse) {
+        return Ok(());
+    }
+
+    if state.browser_actions_dir.as_ref() == Some(&state.current_dir) {
         return Ok(());
     }
 
@@ -644,9 +787,11 @@ fn refresh_browser_actions(state: &mut TuiState) -> Result<(), Box<dyn Error>> {
     actions.extend(directories.into_iter().map(BrowserAction::Enter));
     actions.push(BrowserAction::Quit);
     state.browser_actions = actions;
+    state.browser_actions_dir = Some(state.current_dir.clone());
     if state.browser_index >= state.browser_actions.len() {
         state.browser_index = state.browser_actions.len().saturating_sub(1);
     }
+    state.mark_dirty();
     Ok(())
 }
 
@@ -663,14 +808,25 @@ fn draw_tui(frame: &mut Frame, state: &TuiState) {
 fn draw_browse_view(frame: &mut Frame, state: &TuiState) {
     let shell = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(10), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(shell[1]);
 
-    render_header(frame, shell[0], "dust", "Browse", &state.current_dir, "Ready");
+    render_header(
+        frame,
+        shell[0],
+        "dust",
+        "Browse",
+        &state.current_dir,
+        "Ready",
+    );
 
     let items: Vec<ListItem> = state
         .browser_actions
@@ -718,7 +874,11 @@ fn draw_root_view(frame: &mut Frame, state: &TuiState) {
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(6), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let title = Paragraph::new(vec![Line::from(Span::styled(
@@ -732,7 +892,12 @@ fn draw_root_view(frame: &mut Frame, state: &TuiState) {
     let items: Vec<ListItem> = state
         .roots
         .iter()
-        .map(|root| ListItem::new(truncate_middle(&root.label, inner_width(chunks[1]).saturating_sub(2))))
+        .map(|root| {
+            ListItem::new(truncate_middle(
+                &root.label,
+                inner_width(chunks[1]).saturating_sub(2),
+            ))
+        })
         .collect();
     let mut list_state = ListState::default();
     list_state.select(Some(state.root_index));
@@ -758,7 +923,11 @@ fn draw_root_view(frame: &mut Frame, state: &TuiState) {
 fn draw_preview_view(frame: &mut Frame, state: &TuiState) {
     let shell = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(10), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -786,20 +955,16 @@ fn draw_preview_view(frame: &mut Frame, state: &TuiState) {
     .wrap(Wrap { trim: true });
     frame.render_widget(preview_path, list_chunks[0]);
 
-    let items: Vec<ListItem> = state
-        .preview_targets
-        .iter()
-        .map(|entry| {
-            ListItem::new(format_preview_entry_lines(
-                entry,
-                inner_width(list_chunks[1]).saturating_sub(4),
-            ))
-        })
-        .collect();
     let mut list_state = ListState::default();
     if !state.preview_targets.is_empty() {
         list_state.select(Some(state.preview_index));
     }
+    let items: Vec<ListItem> = state
+        .preview_render_cache
+        .items
+        .iter()
+        .map(RenderedPreviewItem::to_list_item)
+        .collect();
     let list = List::new(items)
         .block(panel_block("Items to Remove"))
         .highlight_style(
@@ -854,9 +1019,19 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
     render_segmented_control(frame, chunks[0], if mode == "Preview" { 1 } else { 0 });
 
     let toolbar = Paragraph::new(Line::from(vec![
-        Span::styled(app, Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            app,
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled(mode, Style::default().fg(COLOR_ACCENT_ALT).add_modifier(Modifier::DIM)),
+        Span::styled(
+            mode,
+            Style::default()
+                .fg(COLOR_ACCENT_ALT)
+                .add_modifier(Modifier::DIM),
+        ),
         Span::raw("   "),
         Span::styled("•", Style::default().fg(COLOR_MUTED)),
         Span::raw("  "),
@@ -884,18 +1059,29 @@ fn render_browse_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
     let details = Paragraph::new(vec![
         Line::from(Span::styled(
             "Summary",
-            Style::default().fg(COLOR_ACCENT_ALT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_ACCENT_ALT)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!("Folder: {}", file_name_or_path(&state.current_dir))),
-        Line::from(format!("Entries: {}", state.browser_actions.len().saturating_sub(4))),
+        Line::from(format!(
+            "Entries: {}",
+            state.browser_actions.len().saturating_sub(4)
+        )),
         Line::from(format!(
             "Parent folder: {}",
-            if state.current_dir.parent().is_some() { "available" } else { "none" }
+            if state.current_dir.parent().is_some() {
+                "available"
+            } else {
+                "none"
+            }
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Keys",
-            Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_WARNING)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from("Use arrows or j/k to move."),
         Line::from("Press Enter to open a folder."),
@@ -915,7 +1101,9 @@ fn render_preview_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
         let mut lines = vec![
             Line::from(Span::styled(
                 "Selected",
-                Style::default().fg(COLOR_ACCENT_ALT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_ACCENT_ALT)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(format!("Type: {}", selected_type_label(entry))),
             Line::from(format!("Size: {}", target_size_text(entry))),
@@ -932,11 +1120,16 @@ fn render_preview_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
             )),
             Line::from(""),
         ]);
-        lines.extend(scan_summary_lines(state, inner_width(area).saturating_sub(1)));
+        lines.extend(scan_summary_lines(
+            state,
+            inner_width(area).saturating_sub(1),
+        ));
         lines.extend([
             Line::from(Span::styled(
                 "Keys",
-                Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_WARNING)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from("Review the planned targets."),
             Line::from("Use ↑/↓ or j/k to inspect each entry."),
@@ -948,18 +1141,25 @@ fn render_preview_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
         let mut lines = vec![
             Line::from(Span::styled(
                 "Selected",
-                Style::default().fg(COLOR_ACCENT_ALT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_ACCENT_ALT)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from("Type: -"),
             Line::from("Size: -"),
             Line::from("Nothing to remove yet."),
             Line::from(""),
         ];
-        lines.extend(scan_summary_lines(state, inner_width(area).saturating_sub(1)));
+        lines.extend(scan_summary_lines(
+            state,
+            inner_width(area).saturating_sub(1),
+        ));
         lines.extend([
             Line::from(Span::styled(
                 "Keys",
-                Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_WARNING)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from("Review the planned targets."),
             Line::from("Use ↑/↓ or j/k to inspect each entry."),
@@ -969,7 +1169,9 @@ fn render_preview_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
         lines
     };
     frame.render_widget(
-        Paragraph::new(lines).block(panel_block("Info")).wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .block(panel_block("Info"))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -1020,7 +1222,9 @@ fn panel_block<'a>(title: &'a str) -> Block<'a> {
     Block::default()
         .title(Span::styled(
             title,
-            Style::default().fg(COLOR_ACCENT_ALT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_ACCENT_ALT)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1037,7 +1241,9 @@ fn separator_block(borders: Borders) -> Block<'static> {
 /// Formats the short header status text for preview mode.
 fn preview_status_line(state: &TuiState) -> String {
     match &state.preview_status {
-        PreviewStatus::Scanning { started_at } => format!("scanning • {:.1?}", started_at.elapsed()),
+        PreviewStatus::Scanning { started_at } => {
+            format!("scanning • {:.1?}", started_at.elapsed())
+        }
         PreviewStatus::CalculatingSize {
             started_at,
             target_count,
@@ -1060,7 +1266,9 @@ fn preview_status_line(state: &TuiState) -> String {
 fn scan_summary_lines(state: &TuiState, max_width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         "Scan",
-        Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(COLOR_SUCCESS)
+            .add_modifier(Modifier::BOLD),
     ))];
 
     match &state.preview_status {
@@ -1069,7 +1277,9 @@ fn scan_summary_lines(state: &TuiState, max_width: usize) -> Vec<Line<'static>> 
                 &format!("Looking for items… {:.1?}", started_at.elapsed()),
                 max_width,
             )));
-            lines.push(Line::from("The list will appear as soon as scanning finishes."));
+            lines.push(Line::from(
+                "The list will appear as soon as scanning finishes.",
+            ));
         }
         PreviewStatus::CalculatingSize {
             started_at,
@@ -1077,17 +1287,27 @@ fn scan_summary_lines(state: &TuiState, max_width: usize) -> Vec<Line<'static>> 
             sized_count,
         } => {
             lines.push(Line::from(truncate_middle(
-                &format!("Found {target_count} item(s) in {:.1?}", state.preview_found_elapsed),
+                &format!(
+                    "Found {target_count} item(s) in {:.1?}",
+                    state.preview_found_elapsed
+                ),
                 max_width,
             )));
             lines.push(Line::from(truncate_middle(
-                &format!("Sized {sized_count}/{target_count}… {:.1?}", started_at.elapsed()),
+                &format!(
+                    "Sized {sized_count}/{target_count}… {:.1?}",
+                    started_at.elapsed()
+                ),
                 max_width,
             )));
         }
         PreviewStatus::Ready => {
             lines.push(Line::from(truncate_middle(
-                &format!("Found {} item(s) in {:.1?}", state.preview_targets.len(), state.preview_found_elapsed),
+                &format!(
+                    "Found {} item(s) in {:.1?}",
+                    state.preview_targets.len(),
+                    state.preview_found_elapsed
+                ),
                 max_width,
             )));
             lines.push(Line::from(truncate_middle(
@@ -1156,30 +1376,68 @@ fn format_count(value: usize) -> String {
 /// Formats a browse action into the list text shown to the user.
 fn browser_action_label(action: &BrowserAction, current_dir: &Path, max_width: usize) -> String {
     match action {
-        BrowserAction::UseCurrent => {
-            truncate_middle(&format!("[Scan here] {}", display_path(current_dir)), max_width)
-        }
+        BrowserAction::UseCurrent => truncate_middle(
+            &format!("[Scan here] {}", display_path(current_dir)),
+            max_width,
+        ),
         BrowserAction::GoUp => "[Up] ..".to_string(),
         BrowserAction::ChangeRoot => "[Roots]".to_string(),
-        BrowserAction::Enter(path) => truncate_middle(&format!("{}/", file_name_or_path(path)), max_width),
+        BrowserAction::Enter(path) => {
+            truncate_middle(&format!("{}/", file_name_or_path(path)), max_width)
+        }
         BrowserAction::Quit => "[Quit]".to_string(),
     }
 }
 
-/// Formats a preview entry using either single-line or compact multi-line layout.
-fn format_preview_entry_lines(entry: &RemovalTarget, max_width: usize) -> Vec<Line<'static>> {
-    if max_width <= 48 {
-        return format_preview_entry_compact(entry, max_width);
-    }
-    vec![Line::from(format_preview_entry_single_line(entry, max_width))]
+fn preview_list_width(area: Rect) -> usize {
+    let shell = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(shell[1]);
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(7)])
+        .split(body[0]);
+
+    inner_width(list_chunks[1]).saturating_sub(4)
 }
 
-/// Formats a preview entry for narrow layouts.
-fn format_preview_entry_compact(entry: &RemovalTarget, max_width: usize) -> Vec<Line<'static>> {
-    let label_line =
-        truncate_middle(&format!("[{}] {}", entry.label(), display_path(entry.path())), max_width);
-    let size_line = truncate_middle(&format!("size: {}", target_size_text(entry)), max_width);
-    vec![Line::from(label_line), Line::from(size_line)]
+fn prepare_preview_render_cache(state: &mut TuiState, max_width: usize) {
+    if state.preview_render_cache.width == max_width
+        && state.preview_render_cache.revision == state.preview_render_revision
+    {
+        return;
+    }
+
+    state.preview_render_cache.width = max_width;
+    state.preview_render_cache.revision = state.preview_render_revision;
+    state.preview_render_cache.items = state
+        .preview_targets
+        .iter()
+        .map(|entry| render_preview_item(entry, max_width))
+        .collect();
+}
+
+fn render_preview_item(entry: &RemovalTarget, max_width: usize) -> RenderedPreviewItem {
+    if max_width <= 48 {
+        return RenderedPreviewItem::Compact {
+            label: truncate_middle(
+                &format!("[{}] {}", entry.label(), display_path(entry.path())),
+                max_width,
+            ),
+            size: truncate_middle(&format!("size: {}", target_size_text(entry)), max_width),
+        };
+    }
+
+    RenderedPreviewItem::Single(format_preview_entry_single_line(entry, max_width))
 }
 
 /// Formats a preview entry as a single line with aligned size information.
@@ -1187,30 +1445,24 @@ fn format_preview_entry_single_line(entry: &RemovalTarget, max_width: usize) -> 
     let size = format!("({})", target_size_text(entry));
     let prefix = format!("[{}] ", entry.label());
     if max_width <= prefix.len() + size.len() + 1 {
-        return truncate_middle(&format!("{prefix}{}", display_path(entry.path())), max_width);
+        return truncate_middle(
+            &format!("{prefix}{}", display_path(entry.path())),
+            max_width,
+        );
     }
     let path_width = max_width.saturating_sub(prefix.len() + size.len() + 1);
     let path = truncate_middle(&display_path(entry.path()), path_width);
     format!("{prefix}{path} {size}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selected_stats_are_requested_for_directory_like_targets() {
-        assert!(supports_selected_stats(RemovalKind::Directory));
-        assert!(supports_selected_stats(RemovalKind::LogDirectory));
-        assert!(!supports_selected_stats(RemovalKind::FileGroup));
-    }
-}
-
 /// Builds the list of root entries available to the browse UI.
 fn browser_roots(last_dir: Option<&Path>) -> Vec<BrowserRoot> {
     let mut roots = Vec::new();
     if let Some(path) = last_dir {
-        push_browser_root(&mut roots, BrowserRoot::new(format!("Last: {}", path.display()), path.to_path_buf()));
+        push_browser_root(
+            &mut roots,
+            BrowserRoot::new(format!("Last: {}", path.display()), path.to_path_buf()),
+        );
     }
     if let Ok(current_dir) = env::current_dir() {
         push_browser_root(
@@ -1219,7 +1471,10 @@ fn browser_roots(last_dir: Option<&Path>) -> Vec<BrowserRoot> {
         );
     }
     if let Some(home_dir) = home_dir() {
-        push_browser_root(&mut roots, BrowserRoot::new(format!("Home: {}", home_dir.display()), home_dir));
+        push_browser_root(
+            &mut roots,
+            BrowserRoot::new(format!("Home: {}", home_dir.display()), home_dir),
+        );
     }
     for root in platform_roots() {
         push_browser_root(&mut roots, root);
@@ -1238,11 +1493,16 @@ fn push_browser_root(roots: &mut Vec<BrowserRoot>, root: BrowserRoot) {
 fn list_subdirectories(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut directories = fs::read_dir(path)?
         .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|entry_path| entry_path.is_dir())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
         .collect::<Vec<_>>();
 
-    directories.sort_by_key(|entry| file_name_or_path(entry).to_ascii_lowercase().replace('\\', "/"));
+    directories.sort_by_key(|entry| file_name_or_path(entry).to_ascii_lowercase());
     Ok(directories)
 }
 
@@ -1273,7 +1533,10 @@ fn prompt_initial_browser_dir() -> Result<PathBuf, Box<dyn Error>> {
             return Ok(candidate);
         }
 
-        eprintln!("Directory not found or not a directory: {}", candidate.display());
+        eprintln!(
+            "Directory not found or not a directory: {}",
+            candidate.display()
+        );
     }
 }
 
@@ -1367,4 +1630,16 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_stats_are_requested_for_directory_like_targets() {
+        assert!(supports_selected_stats(RemovalKind::Directory));
+        assert!(supports_selected_stats(RemovalKind::LogDirectory));
+        assert!(!supports_selected_stats(RemovalKind::FileGroup));
+    }
 }

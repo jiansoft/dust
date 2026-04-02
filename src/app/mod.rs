@@ -11,6 +11,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use std::{error::Error, path::Path, time::Instant};
 
+type PlannedOperation = (RemovalKind, String, DeleteOperation);
+
 /// Runs the application in interactive or direct path mode based on the CLI.
 pub(crate) fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if cli.json && cli.path.is_none() {
@@ -52,7 +54,6 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
     let to_delete = collect_cleanup_targets(Path::new(&folder), &config);
     let scan_elapsed = scan_start.elapsed();
     let total_size = calculate_entries_size(&to_delete);
-    let step_count = build_delete_operations(&to_delete).len();
 
     if to_delete.is_empty() {
         if cli.json {
@@ -69,6 +70,9 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
         }
         return Ok(());
     }
+
+    let operations = (cli.json || cli.dry_run).then(|| build_delete_operations(&to_delete));
+    let step_count = operations.as_ref().map_or(0, Vec::len);
 
     if !cli.json && !cli.quiet {
         print_plan(&to_delete, scan_elapsed);
@@ -108,13 +112,24 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
         return Ok(());
     }
 
-    let outcome = execute_removal(
-        &to_delete,
-        cli.json,
-        cli.quiet,
-        cli.no_progress,
-        cli.progress_style,
-    );
+    let outcome = if let Some(operations) = operations.as_ref() {
+        execute_removal_with_operations(
+            &to_delete,
+            operations,
+            cli.json,
+            cli.quiet,
+            cli.no_progress,
+            cli.progress_style,
+        )
+    } else {
+        execute_removal(
+            &to_delete,
+            cli.json,
+            cli.quiet,
+            cli.no_progress,
+            cli.progress_style,
+        )
+    };
     if cli.json {
         print_json(&JsonRun::completed(
             &folder,
@@ -180,11 +195,30 @@ pub(crate) fn execute_removal(
     no_progress: bool,
     progress_style: ProgressStyleKind,
 ) -> RemovalOutcome {
+    let operations = build_delete_operations(entries);
+    execute_removal_with_operations(
+        entries,
+        &operations,
+        json_mode,
+        quiet,
+        no_progress,
+        progress_style,
+    )
+}
+
+/// Executes a pre-built set of delete operations derived from cleanup targets.
+fn execute_removal_with_operations(
+    entries: &[RemovalTarget],
+    operations: &[PlannedOperation],
+    json_mode: bool,
+    quiet: bool,
+    no_progress: bool,
+    progress_style: ProgressStyleKind,
+) -> RemovalOutcome {
     let start_time = Instant::now();
     let mut success = 0usize;
     let mut failed = 0usize;
     let mut failures = Vec::new();
-    let operations = build_delete_operations(entries);
 
     let show_progress = !json_mode && !quiet && !no_progress;
     let progress = show_progress.then(|| {
@@ -194,7 +228,7 @@ pub(crate) fn execute_removal(
         bar
     });
 
-    for operation in &operations {
+    for operation in operations {
         if let Some(bar) = &progress {
             bar.set_message(format_progress_message(
                 &operation.1,
@@ -478,7 +512,7 @@ fn scan_mode_name(mode: ScanMode) -> &'static str {
 }
 
 /// Expands cleanup targets into executable delete operations.
-fn build_delete_operations(entries: &[RemovalTarget]) -> Vec<(RemovalKind, String, DeleteOperation)> {
+fn build_delete_operations(entries: &[RemovalTarget]) -> Vec<PlannedOperation> {
     let mut operations = Vec::new();
 
     for entry in entries {
@@ -495,9 +529,7 @@ fn build_delete_operations(entries: &[RemovalTarget]) -> Vec<(RemovalKind, Strin
 }
 
 /// Executes one low-level filesystem delete operation.
-fn execute_operation(
-    operation: &(RemovalKind, String, DeleteOperation),
-) -> Result<(), std::io::Error> {
+fn execute_operation(operation: &PlannedOperation) -> Result<(), std::io::Error> {
     match operation.2.action() {
         DeleteAction::DeleteFile => std::fs::remove_file(operation.2.path()),
         DeleteAction::DeleteDirectory => std::fs::remove_dir(operation.2.path()),
