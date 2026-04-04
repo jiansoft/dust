@@ -25,6 +25,18 @@
 - 支援 `--progress-style soft|minimal`
 - 可清理多種語言常見的編譯資料夾與輸出檔案
 
+## 執行畫面
+
+以下圖片來自 `dust` 對示範工作目錄實際渲染出的 TUI 畫面。
+
+### 瀏覽模式
+
+![TUI browse mode](./docs/images/readme-tui-browse.png)
+
+### 預覽模式
+
+![TUI preview mode](./docs/images/readme-tui-preview.png)
+
 ## 支援的清理目標
 
 ### 資料夾

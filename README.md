@@ -25,6 +25,18 @@ It is designed for quickly cleaning large workspaces containing projects written
 - Supports `--progress-style soft|minimal`
 - Cleans common build folders and generated files across multiple languages
 
+## Screenshots
+
+Real TUI captures rendered from `dust` against a sample workspace.
+
+### Browse mode
+
+![TUI browse mode](./docs/images/readme-tui-browse.png)
+
+### Preview mode
+
+![TUI preview mode](./docs/images/readme-tui-preview.png)
+
 ## Supported Cleanup Targets
 
 ### Directories
