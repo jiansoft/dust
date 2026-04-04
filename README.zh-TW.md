@@ -102,6 +102,7 @@ cp target/release/dust ~/.cargo/bin/
 
 - [build.sh](./build.sh)：給 Unix、Linux、macOS 使用
 - [build.bat](./build.bat)：給 Windows 使用
+- [build-release-assets.ps1](./build-release-assets.ps1)：用來打包 GitHub Release 資產
 
 ### 預設建置
 
@@ -150,6 +151,63 @@ build.bat
 ```
 
 當有設定 `TARGETS` 時，腳本會先執行 `rustup target add`，再依序建置各 target。
+
+## Release Assets
+
+可使用 [build-release-assets.ps1](./build-release-assets.ps1) 建置並打包可直接上傳到 GitHub Releases 的壓縮檔。
+
+對於非 Windows target，腳本會改用 `cargo zigbuild` 與 Zig，而不是依賴系統上的 `cc` linker。
+
+### 預設 target matrix
+
+腳本預設會處理以下 target：
+
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+
+產生的壓縮檔命名格式如下：
+
+- `dust-v<version>-windows-x86_64.zip`
+- `dust-v<version>-linux-aarch64.tar.gz`
+- `dust-v<version>-macos-aarch64.tar.gz`
+
+### 建置 release assets
+
+```powershell
+.\build-release-assets.ps1
+```
+
+### 只建置指定 target
+
+```powershell
+.\build-release-assets.ps1 -Targets x86_64-pc-windows-msvc,aarch64-apple-darwin
+```
+
+### 使用環境變數
+
+```powershell
+$env:TARGETS = "x86_64-pc-windows-msvc aarch64-apple-darwin"
+$env:PROFILE = "release"
+.\build-release-assets.ps1
+```
+
+### 輸出位置
+
+腳本會把壓縮檔輸出到 `release-assets/`，並在其下方建立各 target 的暫存打包資料夾。
+
+如果是 Windows target，且存在 `dust.pdb`，也會一併打包進壓縮檔。
+
+### Linux 與 macOS target 的額外需求
+
+如果你要在本機建置 Linux 或 macOS target，請先安裝：
+
+```powershell
+cargo install --locked cargo-zigbuild
+pip install ziglang
+```
 
 ## 使用方式
 

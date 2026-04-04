@@ -1,0 +1,116 @@
+name: Release Assets
+
+on:
+  # Build and publish release assets when a version tag is pushed.
+  push:
+    tags:
+      - "v*"
+  # Allow manual runs from the Actions tab for testing.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Build one release archive per target in parallel.
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runs_on: windows-2025
+            use_zigbuild: false
+            archive_glob: release-assets/dust-v*-windows-x86_64.zip
+          - target: aarch64-pc-windows-msvc
+            runs_on: windows-11-arm
+            use_zigbuild: false
+            archive_glob: release-assets/dust-v*-windows-aarch64.zip
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-24.04
+            use_zigbuild: true
+            archive_glob: release-assets/dust-v*-linux-x86_64.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-24.04-arm
+            use_zigbuild: true
+            archive_glob: release-assets/dust-v*-linux-aarch64.tar.gz
+          - target: aarch64-apple-darwin
+            runs_on: macos-15
+            use_zigbuild: true
+            archive_glob: release-assets/dust-v*-macos-aarch64.tar.gz
+
+    steps:
+      # Fetch the repository contents for the current job.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Zig-based cross compilation for Linux/macOS targets depends on Python-installed Zig.
+      - name: Set up Python
+        if: ${{ matrix.use_zigbuild }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Install Zig only for targets that use cargo-zigbuild.
+      - name: Install zig
+        if: ${{ matrix.use_zigbuild }}
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ziglang
+
+      # Install cargo-zigbuild only where Zig is needed.
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.use_zigbuild }}
+        shell: pwsh
+        run: |
+          cargo install --locked cargo-zigbuild
+
+      # Build and package the upload-ready archive for this target.
+      - name: Build release asset
+        shell: pwsh
+        run: |
+          ./build-release-assets.ps1 -Targets "${{ matrix.target }}"
+
+      # Resolve the generated archive path so later steps can upload it.
+      - name: Collect archive path
+        id: collect
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem -Path "${{ matrix.archive_glob }}" -File | Select-Object -First 1
+          if (-not $archive) {
+            throw "Could not find archive for target ${{ matrix.target }}"
+          }
+          "archive_path=$($archive.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "archive_name=$($archive.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Keep each built archive as a workflow artifact until the publish job runs.
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.archive_name }}
+          path: ${{ steps.collect.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    # Publish only for tag-based runs. Manual runs stop at build artifacts.
+    name: Publish GitHub release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      # Download all per-target archives built by the matrix jobs.
+      - name: Download built assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Attach the archives to the GitHub Release and generate default notes.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

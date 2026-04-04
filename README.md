@@ -102,6 +102,7 @@ This repository includes helper scripts for local builds:
 
 - [build.sh](./build.sh) for Unix, Linux, and macOS
 - [build.bat](./build.bat) for Windows
+- [build-release-assets.ps1](./build-release-assets.ps1) for packaging GitHub Release assets
 
 ### Default build
 
@@ -150,6 +151,63 @@ build.bat
 ```
 
 When `TARGETS` is set, the scripts call `rustup target add` before building each target.
+
+## Release Assets
+
+Use [build-release-assets.ps1](./build-release-assets.ps1) to build and package upload-ready archives for GitHub Releases.
+
+For non-Windows targets, the script uses `cargo zigbuild` with Zig instead of relying on the system `cc` linker.
+
+### Default target matrix
+
+By default, the script targets:
+
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+
+Generated archive names follow this format:
+
+- `dust-v<version>-windows-x86_64.zip`
+- `dust-v<version>-linux-aarch64.tar.gz`
+- `dust-v<version>-macos-aarch64.tar.gz`
+
+### Build release assets
+
+```powershell
+.\build-release-assets.ps1
+```
+
+### Build selected targets only
+
+```powershell
+.\build-release-assets.ps1 -Targets x86_64-pc-windows-msvc,aarch64-apple-darwin
+```
+
+### Use environment variables
+
+```powershell
+$env:TARGETS = "x86_64-pc-windows-msvc aarch64-apple-darwin"
+$env:PROFILE = "release"
+.\build-release-assets.ps1
+```
+
+### Output
+
+The script writes archives under `release-assets/` and stages per-target packaging contents in subfolders below it.
+
+On Windows targets, the archive also includes `dust.pdb` when available.
+
+### Requirements for Linux and macOS targets
+
+If you build Linux or macOS targets locally, install these tools first:
+
+```powershell
+cargo install --locked cargo-zigbuild
+pip install ziglang
+```
 
 ## Usage
 
