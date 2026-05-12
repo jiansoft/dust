@@ -57,14 +57,9 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
 
     if to_delete.is_empty() {
         if cli.json {
-            print_json(&JsonRun::no_matches(
-                &folder,
-                mode,
-                &cli.exclude,
-                cli.dry_run,
-                scan_elapsed,
-                0,
-            ))?;
+        print_json(&JsonRun::no_matches(
+            JsonRunContext::new(&folder, mode, &cli.exclude, cli.dry_run, scan_elapsed, &to_delete, 0, 0),
+        ))?;
         } else if !cli.quiet {
             println!("No matching files or directories found.");
         }
@@ -81,13 +76,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
     if cli.dry_run {
         if cli.json {
             print_json(&JsonRun::preview(
-                &folder,
-                mode,
-                &cli.exclude,
-                scan_elapsed,
-                &to_delete,
-                total_size,
-                step_count,
+                JsonRunContext::new(
+                    &folder,
+                    mode,
+                    &cli.exclude,
+                    true,
+                    scan_elapsed,
+                    &to_delete,
+                    total_size,
+                    step_count,
+                ),
             ))?;
         } else if !cli.quiet {
             println!("Dry run complete. No changes were made.");
@@ -98,13 +96,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
     if !confirm_deletion(cli.yes)? {
         if cli.json {
             print_json(&JsonRun::cancelled(
-                &folder,
-                mode,
-                &cli.exclude,
-                scan_elapsed,
-                &to_delete,
-                total_size,
-                step_count,
+                JsonRunContext::new(
+                    &folder,
+                    mode,
+                    &cli.exclude,
+                    false,
+                    scan_elapsed,
+                    &to_delete,
+                    total_size,
+                    step_count,
+                ),
             ))?;
         } else if !cli.quiet {
             println!("Operation cancelled.");
@@ -132,13 +133,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
     };
     if cli.json {
         print_json(&JsonRun::completed(
-            &folder,
-            mode,
-            &cli.exclude,
-            scan_elapsed,
-            &to_delete,
-            total_size,
-            outcome.step_count,
+            JsonRunContext::new(
+                &folder,
+                mode,
+                &cli.exclude,
+                false,
+                scan_elapsed,
+                &to_delete,
+                total_size,
+                outcome.step_count,
+            ),
             outcome,
         ))?;
     }
@@ -343,6 +347,43 @@ struct JsonTarget {
     size_bytes: u64,
 }
 
+/// Shared inputs used to build JSON responses.
+#[derive(Clone, Copy)]
+struct JsonRunContext<'a> {
+    root: &'a str,
+    mode: ScanMode,
+    exclude: &'a [String],
+    dry_run: bool,
+    scan_elapsed: std::time::Duration,
+    targets: &'a [RemovalTarget],
+    total_size_bytes: u64,
+    step_count: usize,
+}
+
+impl<'a> JsonRunContext<'a> {
+    fn new(
+        root: &'a str,
+        mode: ScanMode,
+        exclude: &'a [String],
+        dry_run: bool,
+        scan_elapsed: std::time::Duration,
+        targets: &'a [RemovalTarget],
+        total_size_bytes: u64,
+        step_count: usize,
+    ) -> Self {
+        Self {
+            root,
+            mode,
+            exclude,
+            dry_run,
+            scan_elapsed,
+            targets,
+            total_size_bytes,
+            step_count,
+        }
+    }
+}
+
 impl JsonRun {
     /// Builds a payload for a missing-path result.
     fn missing_path(root: &str) -> Self {
@@ -363,122 +404,40 @@ impl JsonRun {
     }
 
     /// Builds a payload for a completed scan that found no matches.
-    fn no_matches(
-        root: &str,
-        mode: ScanMode,
-        exclude: &[String],
-        dry_run: bool,
-        scan_elapsed: std::time::Duration,
-        step_count: usize,
-    ) -> Self {
-        Self::base(
-            root,
-            mode,
-            exclude,
-            dry_run,
-            scan_elapsed,
-            &[],
-            0,
-            step_count,
-            JsonStatus::NoMatches,
-        )
+    fn no_matches(context: JsonRunContext<'_>) -> Self {
+        Self::base(context, JsonStatus::NoMatches)
     }
 
     /// Builds a payload for dry-run preview output.
-    fn preview(
-        root: &str,
-        mode: ScanMode,
-        exclude: &[String],
-        scan_elapsed: std::time::Duration,
-        targets: &[RemovalTarget],
-        total_size_bytes: u64,
-        step_count: usize,
-    ) -> Self {
-        Self::base(
-            root,
-            mode,
-            exclude,
-            true,
-            scan_elapsed,
-            targets,
-            total_size_bytes,
-            step_count,
-            JsonStatus::Preview,
-        )
+    fn preview(context: JsonRunContext<'_>) -> Self {
+        Self::base(context, JsonStatus::Preview)
     }
 
     /// Builds a payload for a user-cancelled cleanup run.
-    fn cancelled(
-        root: &str,
-        mode: ScanMode,
-        exclude: &[String],
-        scan_elapsed: std::time::Duration,
-        targets: &[RemovalTarget],
-        total_size_bytes: u64,
-        step_count: usize,
-    ) -> Self {
-        Self::base(
-            root,
-            mode,
-            exclude,
-            false,
-            scan_elapsed,
-            targets,
-            total_size_bytes,
-            step_count,
-            JsonStatus::Cancelled,
-        )
+    fn cancelled(context: JsonRunContext<'_>) -> Self {
+        Self::base(context, JsonStatus::Cancelled)
     }
 
     /// Builds a payload for a completed cleanup run.
-    fn completed(
-        root: &str,
-        mode: ScanMode,
-        exclude: &[String],
-        scan_elapsed: std::time::Duration,
-        targets: &[RemovalTarget],
-        total_size_bytes: u64,
-        step_count: usize,
-        removal: RemovalOutcome,
-    ) -> Self {
-        let mut payload = Self::base(
-            root,
-            mode,
-            exclude,
-            false,
-            scan_elapsed,
-            targets,
-            total_size_bytes,
-            step_count,
-            JsonStatus::Completed,
-        );
+    fn completed(context: JsonRunContext<'_>, removal: RemovalOutcome) -> Self {
+        let mut payload = Self::base(context, JsonStatus::Completed);
         payload.removal = Some(removal);
         payload
     }
 
     /// Builds the common JSON fields shared by all payload variants.
-    fn base(
-        root: &str,
-        mode: ScanMode,
-        exclude: &[String],
-        dry_run: bool,
-        scan_elapsed: std::time::Duration,
-        targets: &[RemovalTarget],
-        total_size_bytes: u64,
-        step_count: usize,
-        status: JsonStatus,
-    ) -> Self {
+    fn base(context: JsonRunContext<'_>, status: JsonStatus) -> Self {
         Self {
             status,
-            root: root.to_string(),
-            dry_run,
-            mode: scan_mode_name(mode),
-            exclude: exclude.to_vec(),
-            scan_elapsed_ms: scan_elapsed.as_millis(),
-            total_size_bytes,
-            target_count: targets.len(),
-            step_count,
-            targets: targets.iter().map(JsonTarget::from).collect(),
+            root: context.root.to_string(),
+            dry_run: context.dry_run,
+            mode: scan_mode_name(context.mode),
+            exclude: context.exclude.to_vec(),
+            scan_elapsed_ms: context.scan_elapsed.as_millis(),
+            total_size_bytes: context.total_size_bytes,
+            target_count: context.targets.len(),
+            step_count: context.step_count,
+            targets: context.targets.iter().map(JsonTarget::from).collect(),
             removal: None,
             message: None,
         }
@@ -531,9 +490,9 @@ fn build_delete_operations(entries: &[RemovalTarget]) -> Vec<PlannedOperation> {
 /// Executes one low-level filesystem delete operation.
 fn execute_operation(operation: &PlannedOperation) -> Result<(), std::io::Error> {
     match operation.2.action() {
-        DeleteAction::DeleteFile => std::fs::remove_file(operation.2.path()),
-        DeleteAction::DeleteDirectory => std::fs::remove_dir(operation.2.path()),
-        DeleteAction::DeleteDirectoryIfEmpty => match std::fs::remove_dir(operation.2.path()) {
+        DeleteAction::File => std::fs::remove_file(operation.2.path()),
+        DeleteAction::Directory => std::fs::remove_dir(operation.2.path()),
+        DeleteAction::DirectoryIfEmpty => match std::fs::remove_dir(operation.2.path()) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

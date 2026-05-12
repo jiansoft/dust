@@ -82,6 +82,7 @@ const FAST_SKIP_DIRECTORY_NAMES: &[&str] = &[
     ".idea",
     ".vscode",
     ".cache",
+    ".venv",
     ".pnpm-store",
     ".yarn",
     ".nuget",
@@ -114,11 +115,11 @@ pub enum RemovalKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteAction {
     /// Remove a file.
-    DeleteFile,
+    File,
     /// Remove a directory unconditionally.
-    DeleteDirectory,
+    Directory,
     /// Remove a directory only if it is empty at execution time.
-    DeleteDirectoryIfEmpty,
+    DirectoryIfEmpty,
 }
 
 /// A normalized delete step derived from a [`RemovalTarget`].
@@ -272,7 +273,7 @@ impl RemovalTarget {
             RemovalKind::LogDirectory => collect_log_directory_delete_operations(&self.path),
             RemovalKind::FileGroup => grouped_file_paths(self)
                 .iter()
-                .map(|path| DeleteOperation::new(path.to_path_buf(), DeleteAction::DeleteFile))
+                .map(|path| DeleteOperation::new(path.to_path_buf(), DeleteAction::File))
                 .collect(),
         }
     }
@@ -352,8 +353,11 @@ fn collect_cleanup_targets_with_size(
     config: &ScanConfig,
     with_size: bool,
 ) -> Vec<RemovalTarget> {
-    if !config.is_excluded(root)
-        && let Some(target) = removable_directory_target(root, config.mode(), with_size)
+    if config.is_excluded(root) || matches_name(root.file_name(), FAST_SKIP_DIRECTORY_NAMES) {
+        return Vec::new();
+    }
+
+    if let Some(target) = removable_directory_target(root, config.mode(), with_size)
     {
         return vec![target];
     }
@@ -632,9 +636,9 @@ fn collect_directory_delete_operations(path: &Path) -> Vec<DeleteOperation> {
     iter.filter_map(|entry| entry.ok())
         .map(|entry| {
             let action = if entry.file_type().is_dir() {
-                DeleteAction::DeleteDirectory
+                DeleteAction::Directory
             } else {
-                DeleteAction::DeleteFile
+                DeleteAction::File
             };
             DeleteOperation::new(entry.into_path(), action)
         })
@@ -648,12 +652,12 @@ fn collect_log_directory_delete_operations(path: &Path) -> Vec<DeleteOperation> 
         .filter_map(|entry| {
             let entry_path = entry.into_path();
             if entry_path.is_file() && should_remove_log_file(&entry_path) {
-                return Some(DeleteOperation::new(entry_path, DeleteAction::DeleteFile));
+                return Some(DeleteOperation::new(entry_path, DeleteAction::File));
             }
             if entry_path.is_dir() {
                 return Some(DeleteOperation::new(
                     entry_path,
-                    DeleteAction::DeleteDirectoryIfEmpty,
+                    DeleteAction::DirectoryIfEmpty,
                 ));
             }
             None
@@ -744,6 +748,38 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path(), normal_target);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn virtualenv_directories_are_not_scanned() {
+        let root = create_temp_dir("virtualenv_directories_are_not_scanned");
+        let skipped_target = root.join(".venv").join("nested").join("target");
+        let normal_target = root.join("app").join("target");
+        fs::create_dir_all(&skipped_target).unwrap();
+        fs::create_dir_all(&normal_target).unwrap();
+
+        let config = ScanConfig::new(&[], ScanMode::All).unwrap();
+        let results = collect_cleanup_targets_fast(&root, &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path(), normal_target);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn virtualenv_root_is_not_scanned() {
+        let root = create_temp_dir("virtualenv_root_is_not_scanned");
+        let venv = root.join(".venv");
+        let skipped_target = venv.join("nested").join("target");
+        fs::create_dir_all(&skipped_target).unwrap();
+
+        let config = ScanConfig::new(&[], ScanMode::All).unwrap();
+        let results = collect_cleanup_targets_fast(&venv, &config);
+
+        assert!(results.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -927,7 +963,7 @@ mod tests {
         );
         assert!(operations.iter().any(|operation| {
             operation.path() == nested_dir.join("app.exe")
-                && operation.action() == DeleteAction::DeleteFile
+                && operation.action() == DeleteAction::File
         }));
 
         fs::remove_dir_all(root).unwrap();
@@ -946,7 +982,7 @@ mod tests {
 
         assert!(operations.iter().any(|operation| {
             operation.path() == logs_dir.join("app.log")
-                && operation.action() == DeleteAction::DeleteFile
+                && operation.action() == DeleteAction::File
         }));
         assert!(
             !operations
@@ -955,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             operations.last().map(DeleteOperation::action),
-            Some(DeleteAction::DeleteDirectoryIfEmpty)
+            Some(DeleteAction::DirectoryIfEmpty)
         );
 
         fs::remove_dir_all(root).unwrap();

@@ -15,7 +15,7 @@
 - 執行刪除前會要求確認
 - 支援 `--dry-run` 安全預覽
 - 支援重複使用 `--exclude` glob 排除不想處理的路徑
-- 內建略過常見中繼資料與保護資料夾以加快掃描並降低誤刪風險，例如 `.git`、`.idea`、`.vscode`、`coverage`、`deploy`，以及 `rustdoc` 產生的 API 文件輸出目錄
+- 內建略過常見中繼資料與保護資料夾以加快掃描並降低誤刪風險，例如 `.git`、`.idea`、`.vscode`、`.venv`、`coverage`、`deploy`，以及 `rustdoc` 產生的 API 文件輸出目錄
 - 支援 `--yes` 以非互動方式執行
 - 支援 `--dirs-only` 與 `--files-only` 掃描模式
 - 支援 `--json` 輸出，方便腳本與 CI 使用
