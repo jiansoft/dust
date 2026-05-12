@@ -1,9 +1,12 @@
 //! Application entry point and module wiring for the `dust` binary.
 
+#![warn(missing_docs)]
+
 mod app;
 mod cleanup;
 mod cli;
 mod interactive;
+mod update;
 
 use clap::Parser;
 use cli::Cli;

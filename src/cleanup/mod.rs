@@ -357,8 +357,7 @@ fn collect_cleanup_targets_with_size(
         return Vec::new();
     }
 
-    if let Some(target) = removable_directory_target(root, config.mode(), with_size)
-    {
+    if let Some(target) = removable_directory_target(root, config.mode(), with_size) {
         return vec![target];
     }
 
@@ -981,8 +980,7 @@ mod tests {
         let operations = target.delete_operations();
 
         assert!(operations.iter().any(|operation| {
-            operation.path() == logs_dir.join("app.log")
-                && operation.action() == DeleteAction::File
+            operation.path() == logs_dir.join("app.log") && operation.action() == DeleteAction::File
         }));
         assert!(
             !operations

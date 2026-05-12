@@ -6,6 +6,7 @@ use crate::cleanup::{
 };
 use crate::cli::{Cli, ProgressStyleKind};
 use crate::interactive;
+use crate::update;
 use dialoguer::Confirm;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
@@ -15,6 +16,10 @@ type PlannedOperation = (RemovalKind, String, DeleteOperation);
 
 /// Runs the application in interactive or direct path mode based on the CLI.
 pub(crate) fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    if cli.check_updates {
+        return update::run_check(cli.json, cli.quiet);
+    }
+
     if cli.json && cli.path.is_none() {
         return Err(
             "`--json` requires a path argument and does not support interactive mode".into(),
@@ -22,9 +27,11 @@ pub(crate) fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 
     if cli.path.is_none() && !cli.json {
-        return interactive::run_interactive(cli);
+        let update_notice = update::startup_update_notice(false, cli.quiet);
+        return interactive::run_interactive(cli, update_notice);
     }
 
+    update::notify_if_update_available(cli.json, cli.quiet);
     run_once(&cli, cli.path.clone().unwrap_or_default())
 }
 
@@ -57,9 +64,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
 
     if to_delete.is_empty() {
         if cli.json {
-        print_json(&JsonRun::no_matches(
-            JsonRunContext::new(&folder, mode, &cli.exclude, cli.dry_run, scan_elapsed, &to_delete, 0, 0),
-        ))?;
+            print_json(&JsonRun::no_matches(JsonRunContext {
+                root: &folder,
+                mode,
+                exclude: &cli.exclude,
+                dry_run: cli.dry_run,
+                scan_elapsed,
+                targets: &to_delete,
+                total_size_bytes: 0,
+                step_count: 0,
+            }))?;
         } else if !cli.quiet {
             println!("No matching files or directories found.");
         }
@@ -75,18 +89,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
 
     if cli.dry_run {
         if cli.json {
-            print_json(&JsonRun::preview(
-                JsonRunContext::new(
-                    &folder,
-                    mode,
-                    &cli.exclude,
-                    true,
-                    scan_elapsed,
-                    &to_delete,
-                    total_size,
-                    step_count,
-                ),
-            ))?;
+            print_json(&JsonRun::preview(JsonRunContext {
+                root: &folder,
+                mode,
+                exclude: &cli.exclude,
+                dry_run: true,
+                scan_elapsed,
+                targets: &to_delete,
+                total_size_bytes: total_size,
+                step_count,
+            }))?;
         } else if !cli.quiet {
             println!("Dry run complete. No changes were made.");
         }
@@ -95,18 +107,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
 
     if !confirm_deletion(cli.yes)? {
         if cli.json {
-            print_json(&JsonRun::cancelled(
-                JsonRunContext::new(
-                    &folder,
-                    mode,
-                    &cli.exclude,
-                    false,
-                    scan_elapsed,
-                    &to_delete,
-                    total_size,
-                    step_count,
-                ),
-            ))?;
+            print_json(&JsonRun::cancelled(JsonRunContext {
+                root: &folder,
+                mode,
+                exclude: &cli.exclude,
+                dry_run: false,
+                scan_elapsed,
+                targets: &to_delete,
+                total_size_bytes: total_size,
+                step_count,
+            }))?;
         } else if !cli.quiet {
             println!("Operation cancelled.");
         }
@@ -133,16 +143,16 @@ pub(crate) fn run_once(cli: &Cli, folder: String) -> Result<(), Box<dyn Error>> 
     };
     if cli.json {
         print_json(&JsonRun::completed(
-            JsonRunContext::new(
-                &folder,
+            JsonRunContext {
+                root: &folder,
                 mode,
-                &cli.exclude,
-                false,
+                exclude: &cli.exclude,
+                dry_run: false,
                 scan_elapsed,
-                &to_delete,
-                total_size,
-                outcome.step_count,
-            ),
+                targets: &to_delete,
+                total_size_bytes: total_size,
+                step_count: outcome.step_count,
+            },
             outcome,
         ))?;
     }
@@ -358,30 +368,6 @@ struct JsonRunContext<'a> {
     targets: &'a [RemovalTarget],
     total_size_bytes: u64,
     step_count: usize,
-}
-
-impl<'a> JsonRunContext<'a> {
-    fn new(
-        root: &'a str,
-        mode: ScanMode,
-        exclude: &'a [String],
-        dry_run: bool,
-        scan_elapsed: std::time::Duration,
-        targets: &'a [RemovalTarget],
-        total_size_bytes: u64,
-        step_count: usize,
-    ) -> Self {
-        Self {
-            root,
-            mode,
-            exclude,
-            dry_run,
-            scan_elapsed,
-            targets,
-            total_size_bytes,
-            step_count,
-        }
-    }
 }
 
 impl JsonRun {

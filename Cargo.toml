@@ -1,11 +1,12 @@
 [package]
 name = "dust"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 
 build = "build.rs"
 
 [dependencies]
+arboard = { version = "3", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
 dialoguer = "0.12"
 globset = "0.4"
@@ -14,6 +15,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = "3"
 walkdir = "2.5"
 
 [build-dependencies]

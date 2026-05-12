@@ -9,7 +9,7 @@ It is designed for quickly cleaning large workspaces containing projects written
 ## Features
 
 - Recursively scans a target directory
-- Supports both command-line path input and interactive prompt input
+- Supports both command-line path input and an interactive TUI browser
 - Supports a full-screen interactive TUI directory browser
 - Shows all matched items before deletion
 - Requires confirmation before removing anything
@@ -19,6 +19,8 @@ It is designed for quickly cleaning large workspaces containing projects written
 - Supports `--yes` for non-interactive cleanup
 - Supports `--dirs-only` and `--files-only` scan modes
 - Supports `--json` output for scripts and CI
+- Supports `--check-updates` to check the latest GitHub Release version
+- Checks for updates on startup and only shows a notice when a newer version is available; TUI mode shows the notice as an in-app modal
 - Supports `--quiet` to suppress normal console output
 - Supports `--no-progress` to disable the delete progress bar
 - Shows a real delete progress bar with percentage, current target, and current path summary
@@ -217,21 +219,17 @@ pip install ziglang
 dust D:\Project\MyApp
 ```
 
-### Use interactive input
+### Use interactive TUI
 
 ```bash
 dust
 ```
 
-When no path is provided, `dust` first asks for an initial directory and then opens a full-screen interactive TUI browser.
-
-- Press `Enter` on an empty prompt to start from the current working directory
-- Enter a Windows path such as `D:\Project\MyApp` or a Unix path such as `/home/user/project`
-- Relative paths are also accepted if they resolve to a directory
+When no path is provided, `dust` opens a full-screen TUI browser from the current working directory. Any startup update notice is shown as an in-app modal.
 
 - Windows: you can start from available drives, the current directory, the home directory, or the last selected directory
 - Unix/macOS: you can start from `/`, the current directory, the home directory, or the last selected directory
-- Inside the TUI, browse directories, switch roots, preview planned deletions, clean, or quit
+- Inside the TUI, browse directories, switch folders by shortcut or typed path, preview planned deletions, clean, or quit
 - In the default interactive preview, `dust` focuses on directory-like targets; use `--files-only` if you want the preview to list grouped removable files instead
 
 After each cleanup run, the TUI is shown again so you can continue working without restarting the tool.
@@ -270,6 +268,13 @@ dust . --files-only
 
 ```bash
 dust . --dry-run --json
+```
+
+### Check for updates
+
+```bash
+dust --check-updates
+dust --check-updates --json
 ```
 
 ### Quiet mode

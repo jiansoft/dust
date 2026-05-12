@@ -51,6 +51,10 @@ pub(crate) struct Cli {
     /// 輸出 JSON 結果
     #[arg(long)]
     pub(crate) json: bool,
+
+    /// 檢查 GitHub 是否有新版本
+    #[arg(long)]
+    pub(crate) check_updates: bool,
 }
 
 /// Available visual styles for delete progress output.
