@@ -46,27 +46,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Zig-based cross compilation for Linux/macOS targets depends on Python-installed Zig.
-      - name: Set up Python
-        if: ${{ matrix.use_zigbuild }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
       # Install Zig only for targets that use cargo-zigbuild.
-      - name: Install zig
+      - name: Set up Zig
+        if: ${{ matrix.use_zigbuild }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.14.1"
+
+      - name: Verify Zig
         if: ${{ matrix.use_zigbuild }}
         shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install ziglang
-          $pythonScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-          if (-not (Test-Path -LiteralPath $pythonScripts)) {
-            throw "Python scripts directory was not found: $pythonScripts"
-          }
-          $pythonScripts | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          $env:PATH = "$pythonScripts$([System.IO.Path]::PathSeparator)$env:PATH"
-          zig version
+        run: zig version
 
       # Install cargo-zigbuild only where Zig is needed.
       - name: Install cargo-zigbuild
