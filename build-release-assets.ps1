@@ -82,9 +82,12 @@ function Test-IsWindowsTarget {
 }
 
 function Test-RequiresZigbuild {
-    param([string]$Target)
+    param(
+        [string]$Target,
+        [string]$HostTriple
+    )
 
-    return -not (Test-IsWindowsTarget -Target $Target)
+    return (-not (Test-IsWindowsTarget -Target $Target)) -and ($Target -ne $HostTriple)
 }
 
 function Get-ArchiveExtension {
@@ -221,7 +224,7 @@ foreach ($target in $Targets) {
     $buildStart = Get-Date
     Push-Location $RepoRoot
     try {
-        if (Test-RequiresZigbuild -Target $target) {
+        if (Test-RequiresZigbuild -Target $target -HostTriple $HostTriple) {
             Assert-ZigbuildToolchain
             cargo zigbuild --profile $Profile --target $target
         } else {

@@ -30,15 +30,15 @@ jobs:
             archive_glob: release-assets/dust-v*-windows-aarch64.zip
           - target: x86_64-unknown-linux-gnu
             runs_on: ubuntu-24.04
-            use_zigbuild: true
+            use_zigbuild: false
             archive_glob: release-assets/dust-v*-linux-x86_64.tar.gz
           - target: aarch64-unknown-linux-gnu
             runs_on: ubuntu-24.04-arm
-            use_zigbuild: true
+            use_zigbuild: false
             archive_glob: release-assets/dust-v*-linux-aarch64.tar.gz
           - target: aarch64-apple-darwin
             runs_on: macos-15
-            use_zigbuild: true
+            use_zigbuild: false
             archive_glob: release-assets/dust-v*-macos-aarch64.tar.gz
 
     steps:

@@ -41,7 +41,7 @@ On a Windows development machine, validate at least the host target:
 
 The script writes archives to `release-assets/`.
 
-For Linux and macOS targets, `build-release-assets.ps1` uses `cargo zigbuild` with Zig.
+For non-Windows targets, `build-release-assets.ps1` uses normal `cargo build` when the requested target matches the current Rust host triple. It uses `cargo zigbuild` with Zig only when cross-building a non-Windows target.
 
 Install the required tools before building those targets locally:
 
@@ -105,14 +105,14 @@ The `build` job runs once per target in the matrix.
 For each target, it:
 
 - checks out the repository
-- installs Zig and `cargo-zigbuild` for non-Windows targets
+- installs Zig and `cargo-zigbuild` only for matrix entries that request Zig-based cross compilation
 - runs `build-release-assets.ps1` for the current target
 - produces one archive for that target
 - uploads the archive as a workflow artifact
 
-Windows targets use normal `cargo build`.
+Targets that match the runner host use normal `cargo build`.
 
-Linux and macOS targets use `cargo zigbuild` with Zig as the linker toolchain.
+Cross-built Linux and macOS targets use `cargo zigbuild` with Zig as the linker toolchain.
 
 ### `publish` stage
 
