@@ -20,7 +20,7 @@ It is designed for quickly cleaning large workspaces containing projects written
 - Supports `--dirs-only` and `--files-only` scan modes
 - Supports `--json` output for scripts and CI
 - Supports `--check-updates` to check the latest GitHub Release version
-- Checks for updates on startup and only shows a notice when a newer version is available; TUI mode shows the notice as an in-app modal
+- Checks for updates on startup and only shows a notice when a newer version is available; TUI mode shows the notice as an in-app modal with a self-update shortcut
 - Supports `--quiet` to suppress normal console output
 - Supports `--no-progress` to disable the delete progress bar
 - Shows a real delete progress bar with percentage, current target, and current path summary
@@ -276,6 +276,8 @@ dust . --dry-run --json
 dust --check-updates
 dust --check-updates --json
 ```
+
+When the TUI update modal appears, press `u` to download the matching GitHub Release archive and schedule the current binary to be replaced after `dust` exits. Press `Enter` to open the release page instead.
 
 ### Quiet mode
 

@@ -20,7 +20,7 @@
 - 支援 `--dirs-only` 與 `--files-only` 掃描模式
 - 支援 `--json` 輸出，方便腳本與 CI 使用
 - 支援 `--check-updates` 檢查 GitHub Release 是否有新版本
-- 啟動時會檢查更新，只有在有新版本時才顯示提示；TUI 模式會以內嵌 modal 顯示
+- 啟動時會檢查更新，只有在有新版本時才顯示提示；TUI 模式會以內嵌 modal 顯示，並提供自動更新快捷鍵
 - 支援 `--quiet` 隱藏一般輸出
 - 支援 `--no-progress` 停用刪除進度列
 - 顯示真正的刪除進度條，包含百分比、目前目標與目前路徑摘要
@@ -276,6 +276,8 @@ dust . --dry-run --json
 dust --check-updates
 dust --check-updates --json
 ```
+
+當 TUI 更新 modal 出現時，按 `u` 會下載符合目前平台的 GitHub Release 壓縮檔，並在 `dust` 結束後排程替換目前執行檔。按 `Enter` 則會開啟 release 頁面。
 
 ### 安靜模式
 

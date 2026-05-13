@@ -7,7 +7,7 @@ use crate::cleanup::{
     summarize_target_contents_for_path,
 };
 use crate::cli::Cli;
-use crate::update::UpdateNotice;
+use crate::update::{self, UpdateNotice};
 use arboard::Clipboard;
 use crossterm::{
     event::{
@@ -124,6 +124,16 @@ enum PreviewAction {
     Clean,
     /// Exit the application.
     Quit,
+}
+
+/// Actions emitted by the update modal key handler.
+enum UpdateModalAction {
+    /// Keep the modal open or simply redraw the TUI.
+    None,
+    /// Exit the TUI.
+    Quit,
+    /// Download and install the selected update.
+    Install(UpdateNotice),
 }
 
 /// Current state of preview scanning and sizing work.
@@ -364,8 +374,35 @@ fn run_tui_loop(
                 }
 
                 if state.update_notice.is_some() {
-                    if handle_update_modal_key(key.code, state) {
-                        return Ok(());
+                    match handle_update_modal_key(key.code, state) {
+                        UpdateModalAction::None => {}
+                        UpdateModalAction::Quit => return Ok(()),
+                        UpdateModalAction::Install(notice) => {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            terminal.show_cursor()?;
+
+                            println!("Downloading dust v{}...", notice.latest_version);
+                            match update::install_update(&notice) {
+                                Ok(install) => {
+                                    println!(
+                                        "Update to dust v{} is scheduled.",
+                                        install.latest_version
+                                    );
+                                    println!(
+                                        "The current binary will be replaced after this process exits:"
+                                    );
+                                    println!("{}", install.target_exe.display());
+                                    println!("Start dust again after this window returns.");
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    eprintln!("Update failed: {error}");
+                                    eprintln!("Release page: {}", notice.release_url);
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -446,7 +483,7 @@ fn open_root_selector(state: &mut TuiState) {
 }
 
 /// Handles key input while the update notice modal is visible.
-fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> bool {
+fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> UpdateModalAction {
     match key {
         KeyCode::Enter => {
             if let Some(notice) = state.update_notice.as_ref() {
@@ -455,14 +492,20 @@ fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> bool {
             state.update_notice = None;
             state.mark_dirty();
         }
+        KeyCode::Char('u') => {
+            if let Some(notice) = state.update_notice.take() {
+                state.mark_dirty();
+                return UpdateModalAction::Install(notice);
+            }
+        }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('d') => {
             state.update_notice = None;
             state.mark_dirty();
         }
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('q') => return UpdateModalAction::Quit,
         _ => {}
     }
-    false
+    UpdateModalAction::None
 }
 
 /// Handles key input while browsing directories.
@@ -1170,7 +1213,7 @@ fn draw_root_view(frame: &mut Frame, state: &TuiState) {
 
 /// Draws the update-available modal over the active TUI screen.
 fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice) {
-    let area = centered_rect_fixed(92, 14, frame.area());
+    let area = centered_rect_fixed(92, 15, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block("Update available"), area);
 
@@ -1204,12 +1247,18 @@ fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice) {
             inner_width(chunks[0]).saturating_sub(1),
         )),
         Line::from(""),
-        Line::from("Open the release page to download the newest archive for your platform."),
+        Line::from(if notice.asset_download_url.is_some() {
+            "Press u to download and install the matching archive for this platform."
+        } else {
+            "No matching archive was found for this platform; open the release page instead."
+        }),
     ])
     .wrap(Wrap { trim: true });
     frame.render_widget(details, chunks[0]);
 
     let footer = Paragraph::new(Line::from(vec![
+        Span::styled("u", Style::default().fg(COLOR_SUCCESS)),
+        Span::raw(": update   "),
         Span::styled("Enter", Style::default().fg(COLOR_SUCCESS)),
         Span::raw(": open   "),
         Span::styled("Esc", Style::default().fg(COLOR_WARNING)),
