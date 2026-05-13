@@ -1217,7 +1217,7 @@ fn draw_browse_view(frame: &mut Frame, state: &TuiState) {
         frame,
         shell[2],
         &format!(
-            "v{}   Enter: preview   r: switch folder   Backspace/←: parent   q: quit",
+            "Enter: preview   r: switch folder   Backspace/←: parent   q: quit   |   dust v{}",
             env!("CARGO_PKG_VERSION")
         ),
     );
