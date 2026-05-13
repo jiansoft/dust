@@ -1,7 +1,16 @@
-//! Version update checks against the project's GitHub releases.
+//! Version update checks and self-update installation against GitHub releases.
 
 use serde::Serialize;
-use std::{cmp::Ordering, env, error::Error, fs, path::PathBuf, time::Duration};
+use std::{
+    cmp::Ordering,
+    env,
+    error::Error,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{self, Command},
+    time::Duration,
+};
 use ureq::ResponseExt;
 
 /// Version embedded from `Cargo.toml` at compile time.
@@ -20,6 +29,8 @@ const USER_AGENT: &str = concat!("dust/", env!("CARGO_PKG_VERSION"));
 const MANUAL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Short timeout used for best-effort startup checks.
 const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout used when downloading a release archive for self-update.
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Minimal fields read from GitHub's latest-release response.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -28,6 +39,18 @@ struct GitHubRelease {
     tag_name: String,
     /// Browser URL for the release page.
     html_url: String,
+    /// Downloadable archives attached to this release.
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
+}
+
+/// Minimal fields read from a GitHub release asset.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct GitHubAsset {
+    /// Asset filename, for example `dust-v0.3.0-windows-x86_64.zip`.
+    name: String,
+    /// Direct browser-download URL for the asset.
+    browser_download_url: String,
 }
 
 /// Cached GitHub release response and validator.
@@ -48,6 +71,37 @@ pub(crate) struct UpdateNotice {
     pub(crate) latest_version: String,
     /// Browser URL where the release can be downloaded.
     pub(crate) release_url: String,
+    /// Direct URL for the archive matching the running platform, when available.
+    pub(crate) asset_download_url: Option<String>,
+    /// Filename for the matching release archive, when available.
+    pub(crate) asset_name: Option<String>,
+}
+
+/// Result returned after a replacement helper has been scheduled.
+#[derive(Debug)]
+pub(crate) struct UpdateInstall {
+    /// Version that was downloaded.
+    pub(crate) latest_version: String,
+    /// Current executable that will be replaced.
+    pub(crate) target_exe: PathBuf,
+}
+
+/// Progress emitted while installing an update.
+#[derive(Debug, Clone)]
+pub(crate) enum UpdateProgress {
+    /// Preparing temporary paths and validating the selected asset.
+    Preparing,
+    /// Downloading the release archive.
+    Downloading {
+        /// Bytes written to disk so far.
+        downloaded: u64,
+        /// Total bytes reported by the server, when available.
+        total: Option<u64>,
+    },
+    /// Extracting the downloaded archive.
+    Extracting,
+    /// Scheduling replacement of the running binary.
+    Scheduling,
 }
 
 /// JSON payload emitted for update checks.
@@ -61,6 +115,10 @@ struct UpdateCheck {
     update_available: bool,
     /// Browser URL where the release can be downloaded.
     release_url: String,
+    /// Direct URL for the archive matching the running platform, when available.
+    asset_download_url: Option<String>,
+    /// Filename for the matching release archive, when available.
+    asset_name: Option<String>,
     /// Human-readable status message.
     message: String,
 }
@@ -103,6 +161,53 @@ pub(crate) fn startup_update_notice(json_mode: bool, quiet: bool) -> Option<Upda
         current_version: payload.current_version,
         latest_version: payload.latest_version,
         release_url: payload.release_url,
+        asset_download_url: payload.asset_download_url,
+        asset_name: payload.asset_name,
+    })
+}
+
+/// Downloads the matching release asset and reports progress before scheduling replacement.
+pub(crate) fn install_update_with_progress<F>(
+    notice: &UpdateNotice,
+    mut progress: F,
+) -> Result<UpdateInstall, Box<dyn Error>>
+where
+    F: FnMut(UpdateProgress),
+{
+    progress(UpdateProgress::Preparing);
+    let asset_url = notice.asset_download_url.as_deref().ok_or_else(|| {
+        format!(
+            "No release asset matches this platform ({})",
+            platform_asset_label()
+        )
+    })?;
+    let asset_name = notice
+        .asset_name
+        .as_deref()
+        .ok_or("The matching release asset did not include a filename")?;
+    let current_exe = env::current_exe()?;
+    let work_dir = update_work_dir(&notice.latest_version)?;
+    let archive_path = work_dir.join(asset_name);
+    let extract_dir = work_dir.join("extract");
+
+    progress(UpdateProgress::Preparing);
+    fs::create_dir_all(&work_dir)?;
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)?;
+    }
+    fs::create_dir_all(&extract_dir)?;
+
+    download_release_asset(asset_url, &archive_path, &mut progress)?;
+    progress(UpdateProgress::Extracting);
+    extract_release_archive(&archive_path, &extract_dir)?;
+    let new_exe = find_extracted_binary(&extract_dir)
+        .ok_or_else(|| format!("Downloaded archive did not contain {}", binary_name()))?;
+    progress(UpdateProgress::Scheduling);
+    schedule_binary_replacement(&current_exe, &new_exe, &work_dir)?;
+
+    Ok(UpdateInstall {
+        latest_version: notice.latest_version.clone(),
+        target_exe: current_exe,
     })
 }
 
@@ -121,14 +226,25 @@ fn build_update_check(release: GitHubRelease) -> UpdateCheck {
     } else {
         format!("dust is up to date: v{CURRENT_VERSION}")
     };
+    let matching_asset = matching_asset(&release, latest_version);
+    let asset_download_url = matching_asset.map(|asset| asset.browser_download_url.clone());
+    let asset_name = matching_asset.map(|asset| asset.name.clone());
 
     UpdateCheck {
         current_version: CURRENT_VERSION.to_string(),
         latest_version: latest_version.to_string(),
         update_available,
         release_url: release.html_url,
+        asset_download_url,
+        asset_name,
         message,
     }
+}
+
+/// Finds the release asset matching the running platform and architecture.
+fn matching_asset<'a>(release: &'a GitHubRelease, version: &str) -> Option<&'a GitHubAsset> {
+    let expected = expected_asset_name(version);
+    release.assets.iter().find(|asset| asset.name == expected)
 }
 
 /// Fetches the latest release from GitHub using the provided timeout.
@@ -150,7 +266,11 @@ fn fetch_latest_release_from_api(timeout: Duration) -> Result<GitHubRelease, Box
         .get(LATEST_RELEASE_URL)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", USER_AGENT);
-    if let Some(etag) = cached.as_ref().and_then(|cache| cache.etag.as_deref()) {
+    if let Some(etag) = cached
+        .as_ref()
+        .filter(|cache| !cache.release.assets.is_empty())
+        .and_then(|cache| cache.etag.as_deref())
+    {
         request = request.header("If-None-Match", etag);
     }
 
@@ -196,6 +316,7 @@ fn fetch_latest_release_from_redirect(timeout: Duration) -> Result<GitHubRelease
     Ok(GitHubRelease {
         tag_name: tag_name.to_string(),
         html_url: release_url,
+        assets: Vec::new(),
     })
 }
 
@@ -217,7 +338,230 @@ fn fetch_latest_release_from_raw_manifest(
     Ok(GitHubRelease {
         tag_name: format!("v{version}"),
         html_url: format!("{RELEASE_TAG_URL_PREFIX}v{version}"),
+        assets: Vec::new(),
     })
+}
+
+/// Returns a stable temp directory for this update attempt.
+fn update_work_dir(version: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let mut version_slug = String::with_capacity(version.len());
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            version_slug.push(ch);
+        } else {
+            version_slug.push('_');
+        }
+    }
+    Ok(env::temp_dir().join(format!("dust-update-{version_slug}-{}", process::id())))
+}
+
+/// Downloads a release archive to disk.
+fn download_release_asset<F>(
+    url: &str,
+    destination: &Path,
+    progress: &mut F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(UpdateProgress),
+{
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(UPDATE_DOWNLOAD_TIMEOUT))
+        .build()
+        .into();
+    let response = agent.get(url).header("User-Agent", USER_AGENT).call()?;
+    if !response.status().is_success() {
+        return Err(format!("Release asset download returned {}", response.status()).into());
+    }
+
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let mut reader = response.into_body().into_reader();
+    let mut file = fs::File::create(destination)?;
+    let mut downloaded = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    progress(UpdateProgress::Downloading { downloaded, total });
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])?;
+        downloaded += read as u64;
+        progress(UpdateProgress::Downloading { downloaded, total });
+    }
+    Ok(())
+}
+
+/// Extracts the downloaded release archive using tools already available on each platform.
+fn extract_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    let status = {
+        let script_path = extract_dir.join("extract-update.ps1");
+        fs::write(
+            &script_path,
+            r#"param(
+    [Parameter(Mandatory=$true)][string]$ArchivePath,
+    [Parameter(Mandatory=$true)][string]$DestinationPath
+)
+$ErrorActionPreference = 'Stop'
+Expand-Archive -LiteralPath $ArchivePath -DestinationPath $DestinationPath -Force
+"#,
+        )?;
+        Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script_path)
+            .arg(archive_path)
+            .arg(extract_dir)
+            .status()?
+    };
+
+    #[cfg(not(windows))]
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(extract_dir)
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Archive extraction failed with status {status}").into())
+    }
+}
+
+/// Finds the new `dust` binary inside the extracted archive.
+fn find_extracted_binary(extract_dir: &Path) -> Option<PathBuf> {
+    let direct = extract_dir.join(binary_name());
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    walkdir::WalkDir::new(extract_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(binary_name()))
+        })
+}
+
+/// Schedules replacing the running executable after the current process exits.
+fn schedule_binary_replacement(
+    current_exe: &Path,
+    new_exe: &Path,
+    work_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        let script_path = work_dir.join("install-update.ps1");
+        fs::write(
+            &script_path,
+            r#"param(
+    [Parameter(Mandatory=$true)][string]$TargetPath,
+    [Parameter(Mandatory=$true)][string]$SourcePath,
+    [Parameter(Mandatory=$true)][int]$PidToWait
+)
+$ErrorActionPreference = 'Stop'
+$target = $TargetPath
+$source = $SourcePath
+$backup = "$target.old"
+Wait-Process -Id $pidToWait -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 250
+if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+if (Test-Path -LiteralPath $target) { Move-Item -LiteralPath $target -Destination $backup -Force }
+Move-Item -LiteralPath $source -Destination $target -Force
+if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+"#,
+        )?;
+        Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script_path)
+            .arg(current_exe)
+            .arg(new_exe)
+            .arg(process::id().to_string())
+            .spawn()?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script_path = work_dir.join("install-update.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eu
+target="$1"
+source="$2"
+pid_to_wait="$3"
+while kill -0 "$pid_to_wait" 2>/dev/null; do
+  sleep 0.2
+done
+chmod +x "$source"
+mv "$source" "$target"
+"#,
+        )?;
+        Command::new("sh")
+            .arg(script_path)
+            .arg(current_exe)
+            .arg(new_exe)
+            .arg(process::id().to_string())
+            .spawn()?;
+    }
+
+    Ok(())
+}
+
+/// Expected release-asset filename for this binary.
+fn expected_asset_name(version: &str) -> String {
+    format!(
+        "dust-v{version}-{}-{}{}",
+        platform_label(),
+        arch_label(),
+        archive_extension()
+    )
+}
+
+/// Human-readable platform label used in errors.
+fn platform_asset_label() -> String {
+    format!("{}-{}", platform_label(), arch_label())
+}
+
+/// Binary filename in release archives.
+fn binary_name() -> &'static str {
+    if cfg!(windows) { "dust.exe" } else { "dust" }
+}
+
+fn archive_extension() -> &'static str {
+    if cfg!(windows) { ".zip" } else { ".tar.gz" }
+}
+
+fn platform_label() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+}
+
+fn arch_label() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    }
 }
 
 /// Reads the cached update response from disk.
@@ -346,10 +690,36 @@ mod tests {
         let payload = build_update_check(GitHubRelease {
             tag_name: "v999.0.0".to_string(),
             html_url: "https://example.test/release".to_string(),
+            assets: Vec::new(),
         });
 
         assert!(payload.update_available);
         assert_eq!(payload.latest_version, "999.0.0");
+    }
+
+    #[test]
+    fn update_payload_selects_matching_release_asset() {
+        let expected_name = expected_asset_name("999.0.0");
+        let payload = build_update_check(GitHubRelease {
+            tag_name: "v999.0.0".to_string(),
+            html_url: "https://example.test/release".to_string(),
+            assets: vec![
+                GitHubAsset {
+                    name: "dust-v999.0.0-other-x86_64.zip".to_string(),
+                    browser_download_url: "https://example.test/other".to_string(),
+                },
+                GitHubAsset {
+                    name: expected_name.clone(),
+                    browser_download_url: "https://example.test/match".to_string(),
+                },
+            ],
+        });
+
+        assert_eq!(payload.asset_name.as_deref(), Some(expected_name.as_str()));
+        assert_eq!(
+            payload.asset_download_url.as_deref(),
+            Some("https://example.test/match")
+        );
     }
 
     #[test]

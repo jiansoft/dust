@@ -7,7 +7,7 @@ use crate::cleanup::{
     summarize_target_contents_for_path,
 };
 use crate::cli::Cli;
-use crate::update::UpdateNotice;
+use crate::update::{self, UpdateInstall, UpdateNotice, UpdateProgress};
 use arboard::Clipboard;
 use crossterm::{
     event::{
@@ -124,6 +124,36 @@ enum PreviewAction {
     Clean,
     /// Exit the application.
     Quit,
+}
+
+/// Actions emitted by the update modal key handler.
+enum UpdateModalAction {
+    /// Keep the modal open or simply redraw the TUI.
+    None,
+    /// Exit the TUI.
+    Quit,
+    /// Download and install the selected update.
+    Install(UpdateNotice),
+}
+
+/// Current state of the self-update workflow shown in the update modal.
+enum UpdateInstallStatus {
+    /// The user has not started installing the update.
+    Idle,
+    /// The installer is running in the background.
+    Running(UpdateProgress),
+    /// Replacement has been scheduled and the app should exit.
+    Ready(UpdateInstall),
+    /// The installer failed with a human-readable message.
+    Failed(String),
+}
+
+/// Messages sent from the update worker to the UI thread.
+enum UpdateInstallUpdate {
+    /// Progress changed.
+    Progress(UpdateProgress),
+    /// The worker completed.
+    Finished(Result<UpdateInstall, String>),
 }
 
 /// Current state of preview scanning and sizing work.
@@ -266,6 +296,10 @@ struct TuiState {
     selected_stats_path: Option<PathBuf>,
     /// Pending update notice shown as an overlay modal.
     update_notice: Option<UpdateNotice>,
+    /// Current self-update install state.
+    update_install_status: UpdateInstallStatus,
+    /// Receiver for background self-update progress.
+    update_install_rx: Option<Receiver<UpdateInstallUpdate>>,
     /// Whether the terminal needs to be redrawn.
     needs_redraw: bool,
 }
@@ -300,6 +334,8 @@ impl TuiState {
             selected_stats_request_id: 0,
             selected_stats_path: None,
             update_notice,
+            update_install_status: UpdateInstallStatus::Idle,
+            update_install_rx: None,
             needs_redraw: true,
         }
     }
@@ -336,12 +372,22 @@ fn run_tui_loop(
         if process_selected_stats(state) {
             state.mark_dirty();
         }
+        if process_update_install(state) {
+            state.mark_dirty();
+        }
         request_selected_stats_if_needed(state);
         refresh_browser_actions(state)?;
         let preview_animating = should_animate_preview(state);
-        let tick = Duration::from_millis(if preview_animating { 100 } else { 250 });
+        let update_animating = should_animate_update(state);
+        let tick = Duration::from_millis(if preview_animating || update_animating {
+            100
+        } else {
+            250
+        });
         let should_draw = state.needs_redraw
             || (preview_animating && last_draw.elapsed() >= Duration::from_millis(100));
+        let should_draw =
+            should_draw || (update_animating && last_draw.elapsed() >= Duration::from_millis(100));
 
         if should_draw {
             if matches!(state.mode, TuiMode::Preview) {
@@ -364,8 +410,12 @@ fn run_tui_loop(
                 }
 
                 if state.update_notice.is_some() {
-                    if handle_update_modal_key(key.code, state) {
-                        return Ok(());
+                    match handle_update_modal_key(key.code, state) {
+                        UpdateModalAction::None => {}
+                        UpdateModalAction::Quit => return Ok(()),
+                        UpdateModalAction::Install(notice) => {
+                            start_update_install(notice, state);
+                        }
                     }
                     continue;
                 }
@@ -425,6 +475,73 @@ fn should_animate_preview(state: &TuiState) -> bool {
         )
 }
 
+/// Returns whether the update modal needs periodic redraws.
+fn should_animate_update(state: &TuiState) -> bool {
+    state.update_notice.is_some()
+        && matches!(state.update_install_status, UpdateInstallStatus::Running(_))
+}
+
+/// Pulls pending self-update worker messages into UI state.
+fn process_update_install(state: &mut TuiState) -> bool {
+    let Some(rx) = state.update_install_rx.take() else {
+        return false;
+    };
+
+    let mut changed = false;
+    let mut keep_rx = true;
+    loop {
+        match rx.try_recv() {
+            Ok(UpdateInstallUpdate::Progress(progress)) => {
+                state.update_install_status = UpdateInstallStatus::Running(progress);
+                changed = true;
+            }
+            Ok(UpdateInstallUpdate::Finished(result)) => {
+                state.update_install_status = match result {
+                    Ok(install) => UpdateInstallStatus::Ready(install),
+                    Err(message) => UpdateInstallStatus::Failed(message),
+                };
+                keep_rx = false;
+                changed = true;
+                break;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                state.update_install_status =
+                    UpdateInstallStatus::Failed("Update worker stopped unexpectedly".to_string());
+                keep_rx = false;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if keep_rx {
+        state.update_install_rx = Some(rx);
+    }
+    changed
+}
+
+/// Starts the self-update worker and keeps the modal visible for progress.
+fn start_update_install(notice: UpdateNotice, state: &mut TuiState) {
+    if matches!(state.update_install_status, UpdateInstallStatus::Running(_)) {
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    state.update_install_status = UpdateInstallStatus::Running(UpdateProgress::Preparing);
+    state.update_install_rx = Some(rx);
+    state.mark_dirty();
+
+    thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let result = update::install_update_with_progress(&notice, move |progress| {
+            let _ = progress_tx.send(UpdateInstallUpdate::Progress(progress));
+        })
+        .map_err(|error| error.to_string());
+        let _ = tx.send(UpdateInstallUpdate::Finished(result));
+    });
+}
+
 /// Changes the current browse directory and invalidates cached directory entries.
 fn set_current_dir(state: &mut TuiState, path: PathBuf) {
     if state.current_dir != path {
@@ -446,7 +563,20 @@ fn open_root_selector(state: &mut TuiState) {
 }
 
 /// Handles key input while the update notice modal is visible.
-fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> bool {
+fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> UpdateModalAction {
+    if matches!(state.update_install_status, UpdateInstallStatus::Ready(_)) {
+        return match key {
+            KeyCode::Enter | KeyCode::Char('q') => UpdateModalAction::Quit,
+            _ => UpdateModalAction::None,
+        };
+    }
+    if matches!(state.update_install_status, UpdateInstallStatus::Running(_)) {
+        return match key {
+            KeyCode::Char('q') => UpdateModalAction::Quit,
+            _ => UpdateModalAction::None,
+        };
+    }
+
     match key {
         KeyCode::Enter => {
             if let Some(notice) = state.update_notice.as_ref() {
@@ -455,14 +585,20 @@ fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> bool {
             state.update_notice = None;
             state.mark_dirty();
         }
+        KeyCode::Char('u') => {
+            if let Some(notice) = state.update_notice.as_ref().cloned() {
+                state.mark_dirty();
+                return UpdateModalAction::Install(notice);
+            }
+        }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('d') => {
             state.update_notice = None;
             state.mark_dirty();
         }
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('q') => return UpdateModalAction::Quit,
         _ => {}
     }
-    false
+    UpdateModalAction::None
 }
 
 /// Handles key input while browsing directories.
@@ -1023,7 +1159,7 @@ fn draw_tui(frame: &mut Frame, state: &TuiState) {
     }
 
     if let Some(notice) = state.update_notice.as_ref() {
-        render_update_modal(frame, notice);
+        render_update_modal(frame, notice, &state.update_install_status);
     }
 }
 
@@ -1080,7 +1216,10 @@ fn draw_browse_view(frame: &mut Frame, state: &TuiState) {
     render_action_footer(
         frame,
         shell[2],
-        "Enter: preview   r: switch folder   Backspace/←: parent   q: quit",
+        &format!(
+            "Enter: preview   r: switch folder   Backspace/←: parent   q: quit   |   dust v{}",
+            env!("CARGO_PKG_VERSION")
+        ),
     );
 }
 
@@ -1169,8 +1308,8 @@ fn draw_root_view(frame: &mut Frame, state: &TuiState) {
 }
 
 /// Draws the update-available modal over the active TUI screen.
-fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice) {
-    let area = centered_rect_fixed(92, 14, frame.area());
+fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice, status: &UpdateInstallStatus) {
+    let area = centered_rect_fixed(92, 17, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block("Update available"), area);
 
@@ -1180,10 +1319,10 @@ fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice) {
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(2)])
+        .constraints([Constraint::Min(10), Constraint::Length(2)])
         .split(inner);
 
-    let details = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             format!("dust v{} is available", notice.latest_version),
             Style::default()
@@ -1204,23 +1343,137 @@ fn render_update_modal(frame: &mut Frame, notice: &UpdateNotice) {
             inner_width(chunks[0]).saturating_sub(1),
         )),
         Line::from(""),
-        Line::from("Open the release page to download the newest archive for your platform."),
-    ])
-    .wrap(Wrap { trim: true });
+    ];
+    lines.extend(update_status_lines(
+        notice,
+        status,
+        inner_width(chunks[0]).saturating_sub(1),
+    ));
+
+    let details = Paragraph::new(lines).wrap(Wrap { trim: true });
     frame.render_widget(details, chunks[0]);
 
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(COLOR_SUCCESS)),
-        Span::raw(": open   "),
-        Span::styled("Esc", Style::default().fg(COLOR_WARNING)),
-        Span::raw(": dismiss   "),
-        Span::styled("n", Style::default().fg(COLOR_WARNING)),
-        Span::raw(": remind later   "),
-        Span::styled("q", Style::default().fg(COLOR_WARNING)),
-        Span::raw(": quit"),
-    ]))
-    .wrap(Wrap { trim: true });
+    let footer = Paragraph::new(update_footer_line(status)).wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[1]);
+}
+
+/// Builds status text for the update modal.
+fn update_status_lines(
+    notice: &UpdateNotice,
+    status: &UpdateInstallStatus,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    match status {
+        UpdateInstallStatus::Idle => vec![Line::from(if notice.asset_download_url.is_some() {
+            "Press u to download and install the matching archive for this platform."
+        } else {
+            "No matching archive was found for this platform; open the release page instead."
+        })],
+        UpdateInstallStatus::Running(progress) => vec![
+            Line::from(Span::styled(
+                "Installing",
+                Style::default()
+                    .fg(COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(truncate_middle(&update_progress_text(progress), max_width)),
+            Line::from(progress_bar_line(progress, max_width)),
+        ],
+        UpdateInstallStatus::Ready(install) => vec![
+            Line::from(Span::styled(
+                "Update ready",
+                Style::default()
+                    .fg(COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("dust v{} is scheduled.", install.latest_version)),
+            Line::from(truncate_middle(
+                &format!("Target: {}", install.target_exe.display()),
+                max_width,
+            )),
+            Line::from("Exit dust to finish replacing the current binary."),
+        ],
+        UpdateInstallStatus::Failed(message) => vec![
+            Line::from(Span::styled(
+                "Update failed",
+                Style::default()
+                    .fg(COLOR_WARNING)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(truncate_middle(message, max_width)),
+            Line::from("Open the release page to download the archive manually."),
+        ],
+    }
+}
+
+/// Builds the update modal footer for the current update state.
+fn update_footer_line(status: &UpdateInstallStatus) -> Line<'static> {
+    match status {
+        UpdateInstallStatus::Running(_) => Line::from(vec![
+            Span::styled("q", Style::default().fg(COLOR_WARNING)),
+            Span::raw(": quit"),
+        ]),
+        UpdateInstallStatus::Ready(_) => Line::from(vec![
+            Span::styled("Enter", Style::default().fg(COLOR_SUCCESS)),
+            Span::raw(": exit   "),
+            Span::styled("q", Style::default().fg(COLOR_WARNING)),
+            Span::raw(": quit"),
+        ]),
+        UpdateInstallStatus::Failed(_) | UpdateInstallStatus::Idle => Line::from(vec![
+            Span::styled("u", Style::default().fg(COLOR_SUCCESS)),
+            Span::raw(": update   "),
+            Span::styled("Enter", Style::default().fg(COLOR_SUCCESS)),
+            Span::raw(": open   "),
+            Span::styled("Esc", Style::default().fg(COLOR_WARNING)),
+            Span::raw(": dismiss   "),
+            Span::styled("n", Style::default().fg(COLOR_WARNING)),
+            Span::raw(": remind later   "),
+            Span::styled("q", Style::default().fg(COLOR_WARNING)),
+            Span::raw(": quit"),
+        ]),
+    }
+}
+
+/// Formats the current update progress.
+fn update_progress_text(progress: &UpdateProgress) -> String {
+    match progress {
+        UpdateProgress::Preparing => "Preparing update...".to_string(),
+        UpdateProgress::Downloading { downloaded, total } => {
+            if let Some(total) = total {
+                format!(
+                    "Downloading {} / {}",
+                    format_size(*downloaded),
+                    format_size(*total)
+                )
+            } else {
+                format!("Downloading {}", format_size(*downloaded))
+            }
+        }
+        UpdateProgress::Extracting => "Extracting archive...".to_string(),
+        UpdateProgress::Scheduling => "Scheduling binary replacement...".to_string(),
+    }
+}
+
+/// Builds a compact textual progress bar for determinate download progress.
+fn progress_bar_line(progress: &UpdateProgress, max_width: usize) -> String {
+    let width = max_width.clamp(10, 40);
+    let (filled, percent) = match progress {
+        UpdateProgress::Downloading {
+            downloaded,
+            total: Some(total),
+        } if *total > 0 => {
+            let filled = ((*downloaded).min(*total) * width as u64 / *total) as usize;
+            let percent = ((*downloaded).min(*total) * 100 / *total) as usize;
+            (filled, Some(percent))
+        }
+        _ => (0, None),
+    };
+    let empty = width.saturating_sub(filled);
+    if let Some(percent) = percent {
+        format!("[{}{}] {percent}%", "#".repeat(filled), ".".repeat(empty))
+    } else {
+        format!("[{}]", ".".repeat(width))
+    }
 }
 
 /// Draws the cleanup preview screen with targets and details.
@@ -1329,6 +1582,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw(" "),
+        Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(COLOR_MUTED),
+        ),
         Span::raw("  "),
         Span::styled(
             mode,
@@ -1341,7 +1599,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
         Span::raw("  "),
         Span::raw(truncate_middle(
             &display_path(path),
-            inner_width(chunks[1]).saturating_sub(34),
+            inner_width(chunks[1]).saturating_sub(42),
         )),
         Span::raw("  "),
         Span::styled("•", Style::default().fg(COLOR_MUTED)),
@@ -1350,7 +1608,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
         Span::raw(" "),
         Span::raw(truncate_middle(
             status,
-            inner_width(chunks[1]).saturating_sub(48),
+            inner_width(chunks[1]).saturating_sub(56),
         )),
     ]))
     .block(separator_block(Borders::BOTTOM))
