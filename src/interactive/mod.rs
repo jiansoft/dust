@@ -1622,6 +1622,7 @@ fn render_browse_sidebar(frame: &mut Frame, area: Rect, state: &TuiState) {
                 .fg(COLOR_ACCENT_ALT)
                 .add_modifier(Modifier::BOLD),
         )),
+        Line::from(format!("Version: v{}", env!("CARGO_PKG_VERSION"))),
         Line::from(format!("Folder: {}", file_name_or_path(&state.current_dir))),
         Line::from(format!(
             "Entries: {}",
