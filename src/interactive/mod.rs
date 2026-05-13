@@ -586,7 +586,7 @@ fn handle_update_modal_key(key: KeyCode, state: &mut TuiState) -> UpdateModalAct
             state.mark_dirty();
         }
         KeyCode::Char('u') => {
-            if let Some(notice) = state.update_notice.take() {
+            if let Some(notice) = state.update_notice.as_ref().cloned() {
                 state.mark_dirty();
                 return UpdateModalAction::Install(notice);
             }
