@@ -5,7 +5,8 @@ use std::{
     cmp::Ordering,
     env,
     error::Error,
-    fs, io,
+    fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
     time::Duration,
@@ -85,6 +86,24 @@ pub(crate) struct UpdateInstall {
     pub(crate) target_exe: PathBuf,
 }
 
+/// Progress emitted while installing an update.
+#[derive(Debug, Clone)]
+pub(crate) enum UpdateProgress {
+    /// Preparing temporary paths and validating the selected asset.
+    Preparing,
+    /// Downloading the release archive.
+    Downloading {
+        /// Bytes written to disk so far.
+        downloaded: u64,
+        /// Total bytes reported by the server, when available.
+        total: Option<u64>,
+    },
+    /// Extracting the downloaded archive.
+    Extracting,
+    /// Scheduling replacement of the running binary.
+    Scheduling,
+}
+
 /// JSON payload emitted for update checks.
 #[derive(Debug, Serialize)]
 struct UpdateCheck {
@@ -147,8 +166,15 @@ pub(crate) fn startup_update_notice(json_mode: bool, quiet: bool) -> Option<Upda
     })
 }
 
-/// Downloads the matching release asset and schedules replacement of the running binary.
-pub(crate) fn install_update(notice: &UpdateNotice) -> Result<UpdateInstall, Box<dyn Error>> {
+/// Downloads the matching release asset and reports progress before scheduling replacement.
+pub(crate) fn install_update_with_progress<F>(
+    notice: &UpdateNotice,
+    mut progress: F,
+) -> Result<UpdateInstall, Box<dyn Error>>
+where
+    F: FnMut(UpdateProgress),
+{
+    progress(UpdateProgress::Preparing);
     let asset_url = notice.asset_download_url.as_deref().ok_or_else(|| {
         format!(
             "No release asset matches this platform ({})",
@@ -164,16 +190,19 @@ pub(crate) fn install_update(notice: &UpdateNotice) -> Result<UpdateInstall, Box
     let archive_path = work_dir.join(asset_name);
     let extract_dir = work_dir.join("extract");
 
+    progress(UpdateProgress::Preparing);
     fs::create_dir_all(&work_dir)?;
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
     }
     fs::create_dir_all(&extract_dir)?;
 
-    download_release_asset(asset_url, &archive_path)?;
+    download_release_asset(asset_url, &archive_path, &mut progress)?;
+    progress(UpdateProgress::Extracting);
     extract_release_archive(&archive_path, &extract_dir)?;
     let new_exe = find_extracted_binary(&extract_dir)
         .ok_or_else(|| format!("Downloaded archive did not contain {}", binary_name()))?;
+    progress(UpdateProgress::Scheduling);
     schedule_binary_replacement(&current_exe, &new_exe, &work_dir)?;
 
     Ok(UpdateInstall {
@@ -327,7 +356,14 @@ fn update_work_dir(version: &str) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 /// Downloads a release archive to disk.
-fn download_release_asset(url: &str, destination: &Path) -> Result<(), Box<dyn Error>> {
+fn download_release_asset<F>(
+    url: &str,
+    destination: &Path,
+    progress: &mut F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(UpdateProgress),
+{
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(UPDATE_DOWNLOAD_TIMEOUT))
         .build()
@@ -337,9 +373,25 @@ fn download_release_asset(url: &str, destination: &Path) -> Result<(), Box<dyn E
         return Err(format!("Release asset download returned {}", response.status()).into());
     }
 
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
     let mut reader = response.into_body().into_reader();
     let mut file = fs::File::create(destination)?;
-    io::copy(&mut reader, &mut file)?;
+    let mut downloaded = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    progress(UpdateProgress::Downloading { downloaded, total });
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])?;
+        downloaded += read as u64;
+        progress(UpdateProgress::Downloading { downloaded, total });
+    }
     Ok(())
 }
 
