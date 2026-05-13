@@ -1579,6 +1579,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw(" "),
+        Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(COLOR_MUTED),
+        ),
         Span::raw("  "),
         Span::styled(
             mode,
@@ -1591,7 +1596,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
         Span::raw("  "),
         Span::raw(truncate_middle(
             &display_path(path),
-            inner_width(chunks[1]).saturating_sub(34),
+            inner_width(chunks[1]).saturating_sub(42),
         )),
         Span::raw("  "),
         Span::styled("•", Style::default().fg(COLOR_MUTED)),
@@ -1600,7 +1605,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &str, mode: &str, path: &Pa
         Span::raw(" "),
         Span::raw(truncate_middle(
             status,
-            inner_width(chunks[1]).saturating_sub(48),
+            inner_width(chunks[1]).saturating_sub(56),
         )),
     ]))
     .block(separator_block(Borders::BOTTOM))
